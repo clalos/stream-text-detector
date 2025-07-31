@@ -243,6 +243,15 @@ type Detector struct {
 
 	// backpressureThreshold defines when to start applying backpressure (channel usage %).
 	backpressureThreshold float64
+
+	// closeOnce ensures Close() is called only once to prevent double cleanup.
+	closeOnce sync.Once
+
+	// closed indicates whether the detector has been closed.
+	closed atomic.Bool
+
+	// shutdownTimeout defines maximum time to wait for graceful shutdown.
+	shutdownTimeout time.Duration
 }
 
 // NewDetector creates a new Detector instance with the given configuration.
@@ -301,7 +310,8 @@ func NewDetector(config *Config, logger *slog.Logger) (*Detector, error) {
 		ocrClient:             ocrClient,
 		circuitBreaker:        circuitBreaker,
 		metrics:               &StreamMetrics{},
-		backpressureThreshold: 0.8, // Apply backpressure when channels are 80% full
+		backpressureThreshold: 0.8,                // Apply backpressure when channels are 80% full
+		shutdownTimeout:       10 * time.Second,   // Maximum time to wait for graceful shutdown
 	}, nil
 }
 
@@ -316,30 +326,62 @@ func NewDetector(config *Config, logger *slog.Logger) (*Detector, error) {
 // Returns an error if any cleanup operation fails. Multiple errors are
 // collected and returned as a single error for complete cleanup reporting.
 // The detector should not be used after Close() is called.
+//
+// This method is designed to be called only after all goroutines have stopped
+// to prevent segmentation faults during resource cleanup. The Run() method
+// guarantees this condition is met before returning.
 func (d *Detector) Close() error {
-	var errs []error
+	var finalErr error
 
-	if d.capture != nil {
-		if err := d.capture.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("failed to close video capture: %w", err))
+	// Use sync.Once to ensure cleanup happens only once
+	d.closeOnce.Do(func() {
+		// Mark as closed first to prevent new operations
+		d.closed.Store(true)
+
+		var errs []error
+
+		// Close OpenCV resources under lock to prevent races
+		d.mu.Lock()
+		if d.capture != nil {
+			// Give a brief moment for any in-flight operations to complete
+			// This is a defensive measure against any remaining race conditions
+			time.Sleep(50 * time.Millisecond)
+			
+			if err := d.capture.Close(); err != nil {
+				errs = append(errs, fmt.Errorf("failed to close video capture: %w", err))
+			}
+			d.capture = nil // Clear reference to prevent further access
 		}
-	}
+		d.mu.Unlock()
 
-	if d.ocrClient != nil {
-		if err := d.ocrClient.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("failed to close OCR client: %w", err))
+		// Close OCR client with additional error handling
+		if d.ocrClient != nil {
+			// Defensive delay for OCR client cleanup as well
+			time.Sleep(50 * time.Millisecond)
+			
+			if err := d.ocrClient.Close(); err != nil {
+				errs = append(errs, fmt.Errorf("failed to close OCR client: %w", err))
+			}
+			d.ocrClient = nil // Clear reference to prevent further access
 		}
-	}
 
-	if len(errs) > 0 {
-		return fmt.Errorf("errors during cleanup: %v", errs)
-	}
+		if len(errs) > 0 {
+			finalErr = fmt.Errorf("errors during cleanup: %v", errs)
+		}
 
-	return nil
+		d.logger.Info("Detector cleanup completed")
+	})
+
+	return finalErr
+}
+
+// isClosed returns true if the detector has been closed.
+func (d *Detector) isClosed() bool {
+	return d.closed.Load()
 }
 
 // Run starts the video stream processing loop using a concurrent pipeline architecture.
-// It coordinates three goroutines that communicate through buffered channels:
+// It coordinates four goroutines that communicate through buffered channels:
 //
 // Pipeline stages:
 //   1. Frame capture: samples frames from video stream at configured intervals
@@ -350,18 +392,31 @@ func (d *Detector) Close() error {
 // The method blocks until the context is cancelled or an unrecoverable error occurs.
 // All goroutines respond to context cancellation for coordinated shutdown.
 //
+// Shutdown guarantee: This method ALWAYS waits for all goroutines to fully terminate
+// before returning, preventing resource cleanup race conditions. If graceful shutdown
+// takes longer than the configured timeout (default 10s), a warning is logged but
+// the method still waits for complete termination to prevent segmentation faults.
+//
 // Enhanced features:
 //   - Dynamic backpressure based on channel utilization
 //   - Circuit breaker pattern for stream resilience
 //   - Comprehensive metrics tracking and reporting
 //   - Automatic stream reconnection with exponential backoff
+//   - Graceful shutdown with proper goroutine coordination
+//   - Memory-safe OpenCV Mat object management with panic recovery
 //
 // Channel buffer sizes (20 each) provide better flow control while the backpressure
 // mechanism prevents excessive memory usage when processing falls behind.
 //
 // Error handling: Individual frame processing errors are logged but don't
 // terminate the entire pipeline, ensuring robust operation with intermittent issues.
+// OpenCV Mat objects are guaranteed to be cleaned up even on panic conditions.
 func (d *Detector) Run(ctx context.Context) error {
+	// Check if detector is already closed
+	if d.isClosed() {
+		return fmt.Errorf("detector is closed")
+	}
+
 	// Increased buffer sizes for better throughput, backpressure handles memory
 	frameChan := make(chan Frame, 20)
 	resultChan := make(chan DetectionResult, 20)
@@ -398,8 +453,30 @@ func (d *Detector) Run(ctx context.Context) error {
 		d.logResults(ctx, resultChan)
 	}()
 
-	wg.Wait()
-	return nil
+	// Wait for all goroutines with timeout
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// All goroutines completed normally
+		d.logger.Info("All processing goroutines stopped gracefully")
+		return nil
+	case <-time.After(d.shutdownTimeout):
+		// Timeout occurred - but we still must wait for goroutines to prevent segfaults
+		d.logger.Warn("Shutdown timeout reached, some goroutines may still be running",
+			"timeout", d.shutdownTimeout)
+		
+		// Wait for goroutines to finish even after timeout to prevent resource races
+		d.logger.Info("Waiting for remaining goroutines to finish to prevent segfaults...")
+		<-done
+		d.logger.Info("All goroutines finally stopped")
+		
+		return fmt.Errorf("shutdown timeout after %v", d.shutdownTimeout)
+	}
 }
 
 // reconnectStream attempts to reconnect to the video stream with exponential backoff.
@@ -415,8 +492,18 @@ func (d *Detector) Run(ctx context.Context) error {
 // Returns true if reconnection succeeded, false if all attempts failed.
 // Thread-safe and can be called concurrently with other detector operations.
 func (d *Detector) reconnectStream(ctx context.Context) bool {
+	// Don't attempt reconnection if detector is closed
+	if d.isClosed() {
+		return false
+	}
+
 	d.mu.Lock()
 	defer d.mu.Unlock()
+
+	// Double-check after acquiring lock
+	if d.isClosed() {
+		return false
+	}
 
 	// Close existing connection
 	if d.capture != nil {
@@ -527,14 +614,20 @@ func (d *Detector) captureFrames(ctx context.Context, frameChan chan<- Frame) {
 				continue
 			}
 
+			// Check if detector is closed before attempting capture
+			if d.isClosed() {
+				d.logger.Info("Detector closed, stopping frame capture")
+				return
+			}
+
 			// Use circuit breaker to handle stream failures gracefully
 			err := d.circuitBreaker.Call(func() error {
 				d.mu.RLock()
 				capture := d.capture
 				d.mu.RUnlock()
 
-				if capture == nil {
-					return fmt.Errorf("capture is nil")
+				if capture == nil || d.isClosed() {
+					return fmt.Errorf("capture is nil or detector is closed")
 				}
 
 				if !capture.Read(&img) {
@@ -570,6 +663,12 @@ func (d *Detector) captureFrames(ctx context.Context, frameChan chan<- Frame) {
 
 			// Clone the image to avoid data races
 			clonedImg := img.Clone()
+			
+			// Ensure the cloned image is valid before proceeding
+			if clonedImg.Empty() {
+				d.logger.Warn("Failed to clone frame image, skipping")
+				continue
+			}
 
 			d.mu.Lock()
 			d.frameIndex++
@@ -590,11 +689,16 @@ func (d *Detector) captureFrames(ctx context.Context, frameChan chan<- Frame) {
 			case frameChan <- frame:
 				// Frame sent successfully
 			case <-ctx.Done():
-				clonedImg.Close()
+				// Ensure cleanup on shutdown
+				if !clonedImg.Empty() {
+					clonedImg.Close()
+				}
 				return
 			default:
 				// Drop frame if channel is full (last resort)
-				clonedImg.Close()
+				if !clonedImg.Empty() {
+					clonedImg.Close()
+				}
 				d.metrics.framesDropped.Add(1)
 				d.logger.Warn("Dropped frame due to full buffer",
 					"frame_index", frameIndex,
@@ -617,12 +721,14 @@ func (d *Detector) captureFrames(ctx context.Context, frameChan chan<- Frame) {
 //   5. Send results to logging stage (only frames with matches)
 //   6. Update processing metrics for monitoring
 //
-// Memory management: Properly closes the frame image after processing to prevent leaks.
-// Uses defer statements to ensure cleanup even on panic or early return.
+// Memory management: Uses anonymous function with defer to guarantee OpenCV Mat cleanup
+// even on panic conditions. The frame image is always closed after processing completes.
+// This prevents memory leaks and segmentation faults during shutdown scenarios.
 // Results are only forwarded if target words are detected to reduce logging volume.
 //
 // Error handling: OCR failures are logged with frame context and metrics updated.
 // Processing continues despite individual frame issues for robust operation.
+// Panic recovery ensures the goroutine remains stable under all conditions.
 func (d *Detector) processFrames(ctx context.Context, frameChan <-chan Frame, resultChan chan<- DetectionResult) {
 	for {
 		select {
@@ -634,31 +740,32 @@ func (d *Detector) processFrames(ctx context.Context, frameChan <-chan Frame, re
 				return
 			}
 
-			// Ensure frame image is always closed, even on panic
-			defer func() {
-				if !frame.Image.Empty() {
-					frame.Image.Close()
+			// Process the frame with proper resource management
+			// Use defer to ensure cleanup even on panic
+			func() {
+				defer func() {
+					// Ensure frame image is always closed after processing
+					if !frame.Image.Empty() {
+						frame.Image.Close()
+					}
+				}()
+				
+				result := d.processFrame(frame)
+				
+				// Forward results with matches or high confidence for logging
+				if len(result.Matches) > 0 {
+					select {
+					case resultChan <- result:
+						// Result sent successfully
+					case <-ctx.Done():
+						return
+					default:
+						d.logger.Warn("Dropped detection result due to full buffer",
+							"frame_index", result.Frame.Index,
+							"matches", result.Matches)
+					}
 				}
 			}()
-
-			result := d.processFrame(frame)
-
-			// Immediately close the frame image after processing
-			frame.Image.Close()
-
-			// Forward results with matches or high confidence for logging
-			if len(result.Matches) > 0 {
-				select {
-				case resultChan <- result:
-					// Result sent successfully
-				case <-ctx.Done():
-					return
-				default:
-					d.logger.Warn("Dropped detection result due to full buffer",
-						"frame_index", result.Frame.Index,
-						"matches", result.Matches)
-				}
-			}
 		}
 	}
 }

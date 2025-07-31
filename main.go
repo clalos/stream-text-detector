@@ -191,17 +191,10 @@ func main() {
 
 	// Create context for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	// Handle interrupt signals
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-
-	go func() {
-		<-sigChan
-		logger.Info("Received shutdown signal, stopping...")
-		cancel()
-	}()
 
 	// Create and run the detector
 	detector, err := NewDetector(config, logger)
@@ -209,10 +202,29 @@ func main() {
 		logger.Error("Failed to create detector", "error", err)
 		os.Exit(1)
 	}
-	defer detector.Close()
 
-	if err := detector.Run(ctx); err != nil {
-		logger.Error("Detector failed", "error", err)
+	// Setup signal handler in goroutine
+	go func() {
+		<-sigChan
+		logger.Info("Received shutdown signal, stopping...")
+		cancel()
+	}()
+
+	// Run the detector and handle shutdown properly
+	runErr := detector.Run(ctx)
+
+	// Ensure context is cancelled (in case Run returned due to error)
+	cancel()
+
+	// detector.Run() now guarantees all goroutines have stopped before returning,
+	// so we can safely close resources without race conditions
+	if closeErr := detector.Close(); closeErr != nil {
+		logger.Error("Error during detector cleanup", "error", closeErr)
+	}
+
+	// Handle run errors after cleanup
+	if runErr != nil {
+		logger.Error("Detector failed", "error", runErr)
 		os.Exit(1)
 	}
 
