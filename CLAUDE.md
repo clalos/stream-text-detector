@@ -31,6 +31,7 @@ make test-coverage # Run tests with coverage report
 ```bash
 make run ARGS="-url rtsp://example.com -word BREAKING"
 ./std -url rtsp://example.com -word "BREAKING,URGENT" -interval 2s
+./std -url rtsp://example.com -word BREAKING -verbose  # Enable detailed logging
 ```
 
 ## Architecture
@@ -47,13 +48,18 @@ make run ARGS="-url rtsp://example.com -word BREAKING"
 All code now requires OpenCV and Tesseract to be installed on the system. The build tag separation has been removed for simplicity.
 
 ### Key Types
-- `Config`: CLI configuration parsed from flags
+- `Config`: CLI configuration parsed from flags (includes verbose logging control)
 - `Detector`: High-performance processing engine with worker pool management
 - `OCRWorker`: Individual worker with dedicated Tesseract client
 - `OCRWorkerPool`: Pool manager for coordinating parallel OCR processing
 - `Frame`: Video frame with metadata (index, timestamp)
 - `DetectionResult`: OCR results with confidence and word matches
 - `StreamMetrics`: Enhanced metrics tracking performance and resource utilization
+
+### Logging System
+- **Default Mode**: Shows frame analysis results (match/no match), errors, and reconnection events
+- **Verbose Mode** (`-verbose` flag): Additionally shows internal processing events, worker management, CPU throttling, and performance metrics
+- **Frame Analysis**: Every processed frame generates a log entry (match found or no match detected)
 
 ### Dependencies
 - `gocv.io/x/gocv`: OpenCV Go bindings for video processing

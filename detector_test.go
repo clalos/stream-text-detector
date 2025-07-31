@@ -25,6 +25,7 @@ func TestParseFlags(t *testing.T) {
 				Language:   "eng",
 				Confidence: 0.80,
 				LogFormat:  "json",
+				Verbose:    false,
 			},
 			wantErr: false,
 		},
@@ -38,6 +39,7 @@ func TestParseFlags(t *testing.T) {
 				Language:   "eng",
 				Confidence: 0.80,
 				LogFormat:  "json",
+				Verbose:    false,
 			},
 			wantErr: false,
 		},
@@ -58,6 +60,25 @@ func TestParseFlags(t *testing.T) {
 				Language:   "eng+ita",
 				Confidence: 0.9,
 				LogFormat:  "kv",
+				Verbose:    false,
+			},
+			wantErr: false,
+		},
+		{
+			name: "valid config with verbose flag",
+			args: []string{
+				"-url", "rtsp://example.com",
+				"-word", "test",
+				"-verbose",
+			},
+			want: &Config{
+				URL:        "rtsp://example.com",
+				Words:      []string{"test"},
+				Interval:   time.Second,
+				Language:   "eng",
+				Confidence: 0.80,
+				LogFormat:  "json",
+				Verbose:    true,
 			},
 			wantErr: false,
 		},
@@ -199,13 +220,27 @@ func TestSetupLogger(t *testing.T) {
 			name:   "default to json",
 			format: "invalid",
 		},
+		{
+			name:   "verbose mode",
+			format: "json",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			logger := setupLogger(tt.format)
+			// Test both verbose and non-verbose modes
+			verbose := tt.name == "verbose mode"
+			logger := setupLogger(tt.format, verbose)
 			if logger == nil {
 				t.Error("setupLogger() returned nil")
+			}
+			
+			// Test non-verbose mode as well
+			if !verbose {
+				loggerNonVerbose := setupLogger(tt.format, false)
+				if loggerNonVerbose == nil {
+					t.Error("setupLogger() returned nil for non-verbose mode")
+				}
 			}
 		})
 	}

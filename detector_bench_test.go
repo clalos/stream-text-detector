@@ -139,7 +139,7 @@ func BenchmarkWorkerPool(b *testing.B) {
 
 			// Process frames sequentially
 			for _, frame := range testFrames {
-				_ = worker.processFrame(frame)
+				_ = worker.processFrame(context.Background(), frame)
 			}
 
 			// Clean up

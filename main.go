@@ -12,10 +12,14 @@
 //
 //	./std -url rtsp://example.com/stream -word "BREAKING"
 //
+// With verbose logging for debugging:
+//
+//	./std -url rtsp://example.com/stream -word "BREAKING" -verbose
+//
 // Multiple target words with custom settings:
 //
 //	./std -url rtsp://example.com/stream -word "BREAKING,URGENT,LIVE" \
-//	      -interval 2s -confidence 0.9 -lang eng -logfmt json
+//	      -interval 2s -confidence 0.9 -lang eng -logfmt json -verbose
 //
 // # System Requirements
 //
@@ -79,6 +83,11 @@ type Config struct {
 	// Supported values: "json" for JSON format, "kv" for key=value format.
 	// Default is "json".
 	LogFormat string
+
+	// Verbose enables detailed logging including internal processing events.
+	// When false (default), only frame analysis results, errors, and reconnection
+	// events are logged. When true, additional debug information is shown.
+	Verbose bool
 }
 
 // parseFlags parses command-line arguments and returns the application configuration.
@@ -93,6 +102,7 @@ type Config struct {
 //   - lang: Tesseract language codes (default: "eng")
 //   - confidence: minimum OCR confidence 0.0-1.0 (default: 0.80)
 //   - logfmt: output format "json" or "kv" (default: "json")
+//   - verbose: enable detailed logging (default: false)
 //
 // Returns an error if required flags are missing or values are invalid.
 func parseFlags() (*Config, error) {
@@ -106,6 +116,7 @@ func parseFlags() (*Config, error) {
 		lang       = fs.String("lang", "eng", "Tesseract language codes (plus-separated)")
 		confidence = fs.Float64("confidence", 0.80, "Minimum OCR confidence to count a match")
 		logfmt     = fs.String("logfmt", "json", "Log format: json or kv")
+		verbose    = fs.Bool("verbose", false, "Enable detailed logging of internal processing events")
 	)
 	
 	if err := fs.Parse(os.Args[1:]); err != nil {
@@ -140,24 +151,35 @@ func parseFlags() (*Config, error) {
 		Language:   *lang,
 		Confidence: *confidence,
 		LogFormat:  *logfmt,
+		Verbose:    *verbose,
 	}, nil
 }
 
-// setupLogger configures structured logging based on the specified format.
-// It creates a logger with INFO level that outputs to stdout.
+// setupLogger configures structured logging based on the specified format and verbose mode.
+// It creates a logger that outputs to stdout with the appropriate log level.
 //
 // Supported formats:
 //   - "json": outputs structured JSON logs suitable for log aggregation systems
 //   - "kv": outputs human-readable key=value format for console viewing
 //   - any other value defaults to JSON format
 //
+// Verbose mode control:
+//   - verbose=false: INFO level, shows only frame analysis, errors, and reconnection events
+//   - verbose=true: DEBUG level, shows all internal processing events and diagnostics
+//
 // The logger includes structured fields for all detection events including
 // timestamps, frame indices, matched words, confidence scores, and stream URLs.
-func setupLogger(format string) *slog.Logger {
+func setupLogger(format string, verbose bool) *slog.Logger {
 	var handler slog.Handler
 	
+	// Set log level based on verbose flag
+	logLevel := slog.LevelInfo
+	if verbose {
+		logLevel = slog.LevelDebug
+	}
+	
 	opts := &slog.HandlerOptions{
-		Level: slog.LevelInfo,
+		Level: logLevel,
 	}
 
 	switch format {
@@ -179,16 +201,17 @@ func main() {
 		os.Exit(1)
 	}
 
-	logger := setupLogger(config.LogFormat)
+	logger := setupLogger(config.LogFormat, config.Verbose)
 	slog.SetDefault(logger)
 
-	logger.Info("Starting Stream Text Detector",
+	logger.Debug("Starting Stream Text Detector",
 		"url", config.URL,
 		"words", config.Words,
 		"interval", config.Interval,
 		"language", config.Language,
 		"confidence", config.Confidence,
 		"log_format", config.LogFormat,
+		"verbose", config.Verbose,
 	)
 
 	// Create context for graceful shutdown
@@ -230,5 +253,5 @@ func main() {
 		os.Exit(1)
 	}
 
-	logger.Info("Stream Text Detector stopped")
+	logger.Debug("Stream Text Detector stopped")
 }

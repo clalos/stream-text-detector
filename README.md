@@ -91,7 +91,8 @@ go build -o std .
   -interval 2s \
   -lang eng+ita \
   -confidence 0.85 \
-  -logfmt json
+  -logfmt json \
+  -verbose
 ```
 
 ### Command-Line Options
@@ -104,6 +105,7 @@ go build -o std .
 | `-lang`       | string   | `eng`   | Tesseract language codes, plus-separated (e.g., eng+ita) |
 | `-confidence` | float    | `0.80`  | Minimum OCR confidence (0.0-1.0)             |
 | `-logfmt`     | enum     | `json`  | Log format: `json` or `kv`                    |
+| `-verbose`    | bool     | `false` | Enable detailed logging of internal processing events |
 
 ### Example Output
 
@@ -169,9 +171,29 @@ The application uses a concurrent pipeline architecture:
 - Try different Tesseract language models
 - Verify video quality and text clarity
 
-### Debug Mode
+### Logging Modes
 
-For debugging, you can enable verbose logging by modifying the log level in the source code or using environment variables supported by your system.
+The application supports two logging modes:
+
+**Default Mode** (recommended for production):
+- Shows frame analysis results (match found/no match detected)  
+- Shows errors and reconnection events
+- Minimal output focused on detection results
+
+**Verbose Mode** (`-verbose` flag):
+- Shows all default mode logs
+- Additionally shows internal processing events
+- Worker pool management and OCR processing details
+- CPU throttling and performance metrics
+- Useful for debugging and development
+
+```bash
+# Default logging
+./std -url rtsp://example.com/stream -word BREAKING
+
+# Verbose logging  
+./std -url rtsp://example.com/stream -word BREAKING -verbose
+```
 
 ## Development
 

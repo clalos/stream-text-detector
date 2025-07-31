@@ -440,7 +440,7 @@ func NewOCRWorkerPool(detector *Detector) (*OCRWorkerPool, error) {
 		workers[i] = worker
 	}
 
-	detector.logger.Info("Created OCR worker pool with CPU throttling", 
+	detector.logger.Debug("Created OCR worker pool with CPU throttling", 
 		"worker_count", workerCount, 
 		"cpu_cores", runtime.NumCPU(),
 		"cpu_utilization_target", "80%",
@@ -499,22 +499,22 @@ func (p *OCRWorkerPool) ProcessFrames(ctx context.Context, frameChan <-chan Fram
 
 	select {
 	case <-done:
-		p.detector.logger.Info("All OCR workers stopped gracefully")
+		p.detector.logger.Debug("All OCR workers stopped gracefully")
 	case <-ctx.Done():
-		p.detector.logger.Info("Context cancelled, forcing worker shutdown")
+		p.detector.logger.Debug("Context cancelled, forcing worker shutdown")
 		workerCancel() // Cancel all workers immediately
 		
 		// Wait a short time for graceful shutdown
 		select {
 		case <-done:
-			p.detector.logger.Info("Workers stopped after cancellation")
+			p.detector.logger.Debug("Workers stopped after cancellation")
 		case <-time.After(p.shutdownTimeout):
 			p.detector.logger.Warn("Worker shutdown timeout reached", 
 				"timeout", p.shutdownTimeout,
 				"workers_may_still_be_running", true)
 			// Still wait for workers to prevent resource leaks
 			<-done
-			p.detector.logger.Info("Workers finally stopped after timeout")
+			p.detector.logger.Debug("Workers finally stopped after timeout")
 		}
 	}
 }
@@ -527,7 +527,7 @@ func (w *OCRWorker) processFrames(ctx context.Context, frameChan <-chan Frame, r
 	throttleCheckInterval := 100 * time.Millisecond // Check CPU every 100ms
 	
 	defer func() {
-		w.detector.logger.Info("OCR worker stopped", "worker_id", w.id, "frames_processed", processedCount)
+		w.detector.logger.Debug("OCR worker stopped", "worker_id", w.id, "frames_processed", processedCount)
 	}()
 
 	for {
@@ -593,19 +593,17 @@ func (w *OCRWorker) processFrames(ctx context.Context, frameChan <-chan Frame, r
 				w.detector.metrics.UpdateProcessingTime(processingTime)
 				processedCount++
 
-				// Forward results with matches for logging
-				if len(result.Matches) > 0 {
-					select {
-					case resultChan <- result:
-						// Result sent successfully
-					case <-ctx.Done():
-						return
-					default:
-						w.detector.logger.Warn("Dropped detection result due to full buffer",
-							"worker_id", w.id,
-							"frame_index", result.Frame.Index,
-							"matches", result.Matches)
-					}
+				// Forward all results for logging (both matches and no-matches)
+				select {
+				case resultChan <- result:
+					// Result sent successfully
+				case <-ctx.Done():
+					return
+				default:
+					w.detector.logger.Warn("Dropped detection result due to full buffer",
+						"worker_id", w.id,
+						"frame_index", result.Frame.Index,
+						"matches", result.Matches)
 				}
 			}()
 		}
@@ -832,7 +830,7 @@ func NewDetector(config *Config, logger *slog.Logger) (*Detector, error) {
 	}
 	detector.ocrWorkerPool = ocrWorkerPool
 
-	logger.Info("Detector initialized with CPU throttling and fast shutdown",
+	logger.Debug("Detector initialized with CPU throttling and fast shutdown",
 		"frame_buffer_size", detector.frameBufferSize,
 		"result_buffer_size", detector.resultBufferSize,
 		"cpu_cores", runtime.NumCPU(),
@@ -895,7 +893,7 @@ func (d *Detector) Close() error {
 			finalErr = fmt.Errorf("errors during cleanup: %v", errs)
 		}
 
-		d.logger.Info("Detector cleanup completed")
+		d.logger.Debug("Detector cleanup completed")
 	})
 
 	return finalErr
@@ -956,7 +954,7 @@ func (d *Detector) Run(ctx context.Context) error {
 	frameChan := make(chan Frame, d.frameBufferSize)
 	resultChan := make(chan DetectionResult, d.resultBufferSize)
 
-	d.logger.Info("Starting CPU-throttled processing pipeline",
+	d.logger.Debug("Starting CPU-throttled processing pipeline",
 		"frame_buffer_size", d.frameBufferSize,
 		"result_buffer_size", d.resultBufferSize,
 		"worker_count", d.ocrWorkerPool.workerCount,
@@ -1007,7 +1005,7 @@ func (d *Detector) Run(ctx context.Context) error {
 	select {
 	case <-done:
 		// All goroutines completed normally
-		d.logger.Info("All processing goroutines stopped gracefully")
+		d.logger.Debug("All processing goroutines stopped gracefully")
 		return nil
 	case <-time.After(d.shutdownTimeout):
 		// Timeout occurred - but we still must wait for goroutines to prevent segfaults
@@ -1015,9 +1013,9 @@ func (d *Detector) Run(ctx context.Context) error {
 			"timeout", d.shutdownTimeout)
 		
 		// Wait for goroutines to finish even after timeout to prevent resource races
-		d.logger.Info("Waiting for remaining goroutines to finish to prevent segfaults...")
+		d.logger.Debug("Waiting for remaining goroutines to finish to prevent segfaults...")
 		<-done
-		d.logger.Info("All goroutines finally stopped")
+		d.logger.Debug("All goroutines finally stopped")
 		
 		return fmt.Errorf("shutdown timeout after %v", d.shutdownTimeout)
 	}
@@ -1157,7 +1155,7 @@ func (d *Detector) captureFrames(ctx context.Context, frameChan chan<- Frame) {
 	for {
 		select {
 		case <-ctx.Done():
-			d.logger.Info("Frame capture stopped")
+			d.logger.Debug("Frame capture stopped")
 			return
 		case <-ticker.C:
 			// Apply backpressure if processing is falling behind
@@ -1168,7 +1166,7 @@ func (d *Detector) captureFrames(ctx context.Context, frameChan chan<- Frame) {
 
 			// Check if detector is closed before attempting capture
 			if d.isClosed() {
-				d.logger.Info("Detector closed, stopping frame capture")
+				d.logger.Debug("Detector closed, stopping frame capture")
 				return
 			}
 
@@ -1292,7 +1290,7 @@ func (d *Detector) reportMetrics(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			d.logger.Info("Metrics reporting stopped")
+			d.logger.Debug("Metrics reporting stopped")
 			return
 		case <-ticker.C:
 			lastFrameAge := d.metrics.GetLastFrameAge()
@@ -1303,7 +1301,7 @@ func (d *Detector) reportMetrics(ctx context.Context) {
 			maxBufferUtil := d.metrics.GetMaxBufferUtilization()
 			parallelFrames := d.metrics.GetParallelFramesProcessed()
 
-			d.logger.Info("Enhanced stream metrics report",
+			d.logger.Debug("Enhanced stream metrics report",
 				"frames_processed", d.metrics.GetFramesProcessed(),
 				"parallel_frames_processed", parallelFrames,
 				"frames_dropped", d.metrics.GetFramesDropped(),
@@ -1329,7 +1327,7 @@ func (d *Detector) reportMetrics(ctx context.Context) {
 			// Calculate and log performance statistics
 			if parallelFrames > 0 {
 				processingRate := float64(parallelFrames) / 30.0 // frames per second over 30s interval
-				d.logger.Info("Performance statistics",
+				d.logger.Debug("Performance statistics",
 					"processing_rate_fps", processingRate,
 					"cpu_cores", runtime.NumCPU(),
 					"goroutines", runtime.NumGoroutine())
@@ -1461,43 +1459,70 @@ func (d *Detector) findMatches(text string) []string {
 	return matches
 }
 
-// logResults processes detection results and logs matches using structured logging.
+// logResults processes detection results and logs both matches and non-matches using structured logging.
 // This method runs in its own goroutine and is the final stage of the processing pipeline.
 // It receives detection results and outputs structured log entries for monitoring and analysis.
+//
+// Logging behavior:
+//   - Match found: logs "Text detected in stream" with matched words
+//   - No match found: logs "No target words detected in frame" 
+//   - Both cases include frame analysis metadata for comprehensive monitoring
 //
 // Structured log fields included:
 //   - timestamp: RFC3339 formatted capture time for temporal correlation
 //   - frame_index: unique frame identifier for debugging and tracking
 //   - matched_words: array of detected target words for filtering and alerting
 //   - confidence: OCR confidence score for quality assessment
-//   - extracted_text: complete OCR output for manual verification
+//   - extracted_text: complete OCR output for manual verification (in verbose mode only)
 //   - stream_url: source identifier for multi-stream deployments
 //
 // The logging format (JSON or key=value) is determined by the configuration
 // and optimized for different use cases: JSON for log aggregation systems,
 // key=value for human-readable console output.
 //
-// Only results with matched target words are logged to reduce noise while
-// maintaining all relevant detection events for analysis.
+// All frame analysis results are logged to ensure complete visibility into
+// the detection process, enabling effective monitoring and debugging.
 func (d *Detector) logResults(ctx context.Context, resultChan <-chan DetectionResult) {
 	for {
 		select {
 		case <-ctx.Done():
-			d.logger.Info("Result logging stopped")
+			d.logger.Debug("Result logging stopped")
 			return
 		case result, ok := <-resultChan:
 			if !ok {
 				return
 			}
 
-			d.logger.Info("Text detected in stream",
-				"timestamp", result.Frame.Timestamp.Format(time.RFC3339),
-				"frame_index", result.Frame.Index,
-				"matched_words", result.Matches,
-				"confidence", result.Confidence,
-				"extracted_text", result.Text,
-				"stream_url", d.config.URL,
-			)
+			if len(result.Matches) > 0 {
+				// Match found - always log this as it's a primary detection event
+				d.logger.Info("Text detected in stream",
+					"timestamp", result.Frame.Timestamp.Format(time.RFC3339),
+					"frame_index", result.Frame.Index,
+					"matched_words", result.Matches,
+					"confidence", result.Confidence,
+					"stream_url", d.config.URL,
+				)
+				// Include extracted text in verbose mode for debugging
+				if d.config.Verbose {
+					d.logger.Debug("Extracted text from matched frame",
+						"frame_index", result.Frame.Index,
+						"extracted_text", result.Text)
+				}
+			} else {
+				// No match found - log frame analysis completion
+				d.logger.Info("No target words detected in frame",
+					"timestamp", result.Frame.Timestamp.Format(time.RFC3339),
+					"frame_index", result.Frame.Index,
+					"confidence", result.Confidence,
+					"stream_url", d.config.URL,
+				)
+				// Include extracted text in verbose mode for debugging
+				if d.config.Verbose {
+					d.logger.Debug("Extracted text from non-matched frame",
+						"frame_index", result.Frame.Index,
+						"extracted_text", result.Text)
+				}
+			}
 		}
 	}
 }
