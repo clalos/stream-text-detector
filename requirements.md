@@ -88,7 +88,7 @@ Concurrency note: run capture and OCR in separate goroutines connected by a buff
 | `-url`        | string              | —       | RTSP/HTTP(S) video stream source.        |
 | `-word`       | string (repeatable) | —       | Target word(s) to detect.                |
 | `-interval`   | duration            | `1s`    | Frame sampling interval.                 |
-| `-lang`       | string              | `eng`   | Tesseract language codes (comma-sep).    |
+| `-lang`       | string              | `eng`   | Tesseract language codes (plus-sep).     |
 | `-confidence` | float               | `0.80`  | Minimum OCR confidence to count a match. |
 | `-logfmt`     | enum                | `json`  | `json` or `kv` output.                   |
 

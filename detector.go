@@ -68,6 +68,20 @@ const (
 	CircuitHalfOpen
 )
 
+// String returns a string representation of the CircuitState.
+func (s CircuitState) String() string {
+	switch s {
+	case CircuitClosed:
+		return "CLOSED"
+	case CircuitOpen:
+		return "OPEN"
+	case CircuitHalfOpen:
+		return "HALF_OPEN"
+	default:
+		return "UNKNOWN"
+	}
+}
+
 // CircuitBreaker implements the circuit breaker pattern for stream reliability.
 // It prevents cascade failures by temporarily blocking operations after too many errors.
 type CircuitBreaker struct {
@@ -86,17 +100,20 @@ type CircuitBreaker struct {
 	timeout time.Duration
 	// recoveryThreshold is how many successes needed to close from half-open.
 	recoveryThreshold int64
+	// logger for state transition logging.
+	logger *slog.Logger
 }
 
 // NewCircuitBreaker creates a circuit breaker with the specified configuration.
 // maxFailures: number of consecutive failures before opening
 // timeout: how long to wait before attempting recovery
 // recoveryThreshold: successful operations needed to fully recover
-func NewCircuitBreaker(maxFailures int64, timeout time.Duration, recoveryThreshold int64) *CircuitBreaker {
+func NewCircuitBreaker(maxFailures int64, timeout time.Duration, recoveryThreshold int64, logger *slog.Logger) *CircuitBreaker {
 	cb := &CircuitBreaker{
 		maxFailures:       maxFailures,
 		timeout:           timeout,
 		recoveryThreshold: recoveryThreshold,
+		logger:            logger,
 	}
 	cb.state.Store(int32(CircuitClosed))
 	return cb
@@ -112,13 +129,23 @@ func (cb *CircuitBreaker) Call(fn func() error) error {
 		// Check if timeout has passed to transition to half-open
 		lastFailure := time.Unix(0, cb.lastFailureTime.Load())
 		if time.Since(lastFailure) > cb.timeout {
+			// Attempt to transition to half-open
 			if cb.state.CompareAndSwap(int32(CircuitOpen), int32(CircuitHalfOpen)) {
 				cb.successCount.Store(0)
+				cb.logger.Info("Circuit breaker state transition",
+					"from", "OPEN",
+					"to", "HALF_OPEN",
+					"timeout_elapsed", time.Since(lastFailure))
 			}
+			// Update state for this execution
 			state = CircuitHalfOpen
 		} else {
 			return fmt.Errorf("circuit breaker is open, last failure: %v ago", time.Since(lastFailure))
 		}
+	case CircuitHalfOpen:
+		// Already in half-open, proceed with the operation
+	case CircuitClosed:
+		// Normal operation, proceed
 	}
 
 	err := fn()
@@ -135,9 +162,26 @@ func (cb *CircuitBreaker) Call(fn func() error) error {
 func (cb *CircuitBreaker) recordFailure() {
 	cb.lastFailureTime.Store(time.Now().UnixNano())
 	failures := cb.failureCount.Add(1)
+	currentState := CircuitState(cb.state.Load())
 
-	if failures >= cb.maxFailures {
+	// Transition to OPEN if we've exceeded max failures
+	if failures >= cb.maxFailures && currentState != CircuitOpen {
 		cb.state.Store(int32(CircuitOpen))
+		cb.logger.Warn("Circuit breaker state transition",
+			"from", currentState,
+			"to", "OPEN",
+			"failure_count", failures,
+			"max_failures", cb.maxFailures)
+	}
+
+	// Reset from HALF_OPEN to OPEN on any failure
+	if currentState == CircuitHalfOpen {
+		cb.state.Store(int32(CircuitOpen))
+		cb.successCount.Store(0)
+		cb.logger.Warn("Circuit breaker state transition",
+			"from", "HALF_OPEN",
+			"to", "OPEN",
+			"reason", "failure_during_recovery")
 	}
 }
 
@@ -149,7 +193,13 @@ func (cb *CircuitBreaker) recordSuccess() {
 	if state == CircuitHalfOpen {
 		successes := cb.successCount.Add(1)
 		if successes >= cb.recoveryThreshold {
-			cb.state.Store(int32(CircuitClosed))
+			if cb.state.CompareAndSwap(int32(CircuitHalfOpen), int32(CircuitClosed)) {
+				cb.logger.Info("Circuit breaker state transition",
+					"from", "HALF_OPEN",
+					"to", "CLOSED",
+					"success_count", successes,
+					"recovery_threshold", cb.recoveryThreshold)
+			}
 		}
 	}
 }
@@ -157,6 +207,34 @@ func (cb *CircuitBreaker) recordSuccess() {
 // GetState returns the current circuit breaker state.
 func (cb *CircuitBreaker) GetState() CircuitState {
 	return CircuitState(cb.state.Load())
+}
+
+// Reset forcibly resets the circuit breaker to CLOSED state.
+// This should be called after successful stream reconnection.
+func (cb *CircuitBreaker) Reset() {
+	oldState := CircuitState(cb.state.Load())
+	if oldState != CircuitClosed {
+		cb.state.Store(int32(CircuitClosed))
+		cb.failureCount.Store(0)
+		cb.successCount.Store(0)
+		cb.logger.Info("Circuit breaker reset to CLOSED",
+			"previous_state", oldState,
+			"reason", "successful_reconnection")
+	}
+}
+
+// GetFailureCount returns the current failure count.
+func (cb *CircuitBreaker) GetFailureCount() int64 {
+	return cb.failureCount.Load()
+}
+
+// GetLastFailureTime returns the time of the last failure.
+func (cb *CircuitBreaker) GetLastFailureTime() time.Time {
+	nanos := cb.lastFailureTime.Load()
+	if nanos == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, nanos)
 }
 
 // StreamMetrics tracks health and performance metrics for the video stream.
@@ -600,7 +678,7 @@ func NewDetector(config *Config, logger *slog.Logger) (*Detector, error) {
 		config:                config,
 		logger:                logger,
 		capture:               capture,
-		circuitBreaker:        NewCircuitBreaker(5, 30*time.Second, 3),
+		circuitBreaker:        NewCircuitBreaker(5, 30*time.Second, 3, logger),
 		metrics:               &StreamMetrics{},
 		backpressureThreshold: 0.7,  // Apply backpressure when channels are 70% full (more aggressive)
 		shutdownTimeout:       15 * time.Second,   // Increased timeout for worker coordination
@@ -847,7 +925,9 @@ func (d *Detector) reconnectStream(ctx context.Context) bool {
 		capture, err := gocv.OpenVideoCapture(d.config.URL)
 		if err == nil && capture.IsOpened() {
 			d.capture = capture
-			d.logger.Info("Stream reconnection successful", "attempt", attempt)
+			d.logger.Info("Stream reconnection successful", 
+			"attempt", attempt,
+			"total_reconnect_attempts", d.metrics.GetReconnectAttempts())
 			return true
 		}
 
@@ -948,16 +1028,19 @@ func (d *Detector) captureFrames(ctx context.Context, frameChan chan<- Frame) {
 				d.mu.RUnlock()
 
 				if capture == nil || d.isClosed() {
-					return fmt.Errorf("capture is nil or detector is closed")
+					// Connection error - needs reconnection
+					return fmt.Errorf("connection error: capture is nil or detector is closed")
 				}
 
 				if !capture.Read(&img) {
 					d.metrics.streamErrors.Add(1)
-					return fmt.Errorf("failed to read frame from video stream")
+					// Stream read error - could be temporary or connection issue
+					return fmt.Errorf("stream read error: failed to read frame from video stream")
 				}
 
 				if img.Empty() {
-					return fmt.Errorf("empty frame captured")
+					// Empty frame could indicate stream end or temporary issue
+					return fmt.Errorf("stream error: empty frame captured")
 				}
 
 				return nil
@@ -971,12 +1054,21 @@ func (d *Detector) captureFrames(ctx context.Context, frameChan chan<- Frame) {
 					"circuit_state", state,
 					"stream_errors", d.metrics.GetStreamErrors())
 
-				// If circuit is open, attempt reconnection
+				// Only attempt reconnection if circuit is open (indicating multiple failures)
 				if state == CircuitOpen {
-					d.logger.Info("Circuit breaker open, attempting stream reconnection")
-					if !d.reconnectStream(ctx) {
-						d.logger.Error("Stream reconnection failed, stopping capture")
-						return
+					// Check if this is a connection error that warrants reconnection
+					if strings.Contains(err.Error(), "connection error") || strings.Contains(err.Error(), "stream read error") {
+						d.logger.Info("Circuit breaker open due to connection issues, attempting stream reconnection")
+						if d.reconnectStream(ctx) {
+							// Reset circuit breaker after successful reconnection
+							d.circuitBreaker.Reset()
+							d.logger.Info("Stream reconnected successfully, circuit breaker reset")
+						} else {
+							d.logger.Error("Stream reconnection failed, stopping capture")
+							return
+						}
+					} else {
+						d.logger.Debug("Circuit open but error doesn't warrant reconnection", "error_type", err.Error())
 					}
 				}
 				continue
@@ -1054,6 +1146,8 @@ func (d *Detector) reportMetrics(ctx context.Context) {
 		case <-ticker.C:
 			lastFrameAge := d.metrics.GetLastFrameAge()
 			circuitState := d.circuitBreaker.GetState()
+			circuitFailureCount := d.circuitBreaker.GetFailureCount()
+			lastFailureTime := d.circuitBreaker.GetLastFailureTime()
 			avgProcessingTime := d.metrics.GetAvgProcessingTimeMs()
 			maxBufferUtil := d.metrics.GetMaxBufferUtilization()
 			parallelFrames := d.metrics.GetParallelFramesProcessed()
@@ -1072,6 +1166,13 @@ func (d *Detector) reportMetrics(ctx context.Context) {
 				"frame_buffer_size", d.frameBufferSize,
 				"result_buffer_size", d.resultBufferSize,
 				"circuit_state", circuitState,
+				"circuit_failure_count", circuitFailureCount,
+				"last_failure_age_ms", func() int64 {
+					if lastFailureTime.IsZero() {
+						return -1
+					}
+					return time.Since(lastFailureTime).Milliseconds()
+				}(),
 				"stream_url", d.config.URL)
 
 			// Calculate and log performance statistics
@@ -1088,6 +1189,17 @@ func (d *Detector) reportMetrics(ctx context.Context) {
 				d.logger.Warn("Stream processing may be stalled",
 					"last_frame_age", lastFrameAge,
 					"expected_interval", d.config.Interval)
+			}
+
+			// Log warning if circuit breaker has been open for too long
+			if circuitState == CircuitOpen && !lastFailureTime.IsZero() {
+				timeSinceFailure := time.Since(lastFailureTime)
+				if timeSinceFailure > 2*time.Minute {
+					d.logger.Warn("Circuit breaker has been open for extended period",
+						"time_open", timeSinceFailure,
+						"failure_count", circuitFailureCount,
+						"consider_manual_intervention", true)
+				}
 			}
 
 			// Log performance warnings

@@ -26,7 +26,7 @@ echo "Command: ./std -url rtsp://camera.local/live -word \"BREAKING,URGENT,ALERT
 echo ""
 
 echo "Example 3: Multi-language OCR with higher confidence threshold"
-echo "Command: ./std -url http://stream.example.com/video -word \"notizie,breaking\" -lang eng,ita -confidence 0.9"
+echo "Command: ./std -url http://stream.example.com/video -word \"notizie,breaking\" -lang eng+ita -confidence 0.9"
 echo ""
 
 echo "Example 4: Key-value logging format"

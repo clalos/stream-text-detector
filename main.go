@@ -66,7 +66,7 @@ type Config struct {
 	Interval time.Duration
 
 	// Language specifies Tesseract OCR language codes for text recognition.
-	// Multiple languages can be specified as comma-separated values.
+	// Multiple languages can be specified as plus-separated values.
 	// Common values: "eng", "eng+fra", "spa". Default is "eng".
 	Language string
 
@@ -103,7 +103,7 @@ func parseFlags() (*Config, error) {
 		url        = fs.String("url", "", "RTSP/HTTP(S) video stream source (required)")
 		wordsFlag  = fs.String("word", "", "Target word(s) to detect (comma-separated, required)")
 		interval   = fs.Duration("interval", time.Second, "Frame sampling interval")
-		lang       = fs.String("lang", "eng", "Tesseract language codes (comma-separated)")
+		lang       = fs.String("lang", "eng", "Tesseract language codes (plus-separated)")
 		confidence = fs.Float64("confidence", 0.80, "Minimum OCR confidence to count a match")
 		logfmt     = fs.String("logfmt", "json", "Log format: json or kv")
 	)
