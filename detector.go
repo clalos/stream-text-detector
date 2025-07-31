@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"math"
 	"math/rand"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -159,6 +160,7 @@ func (cb *CircuitBreaker) GetState() CircuitState {
 }
 
 // StreamMetrics tracks health and performance metrics for the video stream.
+// Enhanced with worker pool performance tracking.
 type StreamMetrics struct {
 	// framesProcessed counts total frames successfully processed.
 	framesProcessed atomic.Int64
@@ -172,6 +174,12 @@ type StreamMetrics struct {
 	lastFrameTime atomic.Int64
 	// reconnectAttempts counts how many times stream reconnection was attempted.
 	reconnectAttempts atomic.Int64
+	// parallelFramesProcessed counts frames processed by the worker pool.
+	parallelFramesProcessed atomic.Int64
+	// avgProcessingTimeNs tracks average frame processing time in nanoseconds.
+	avgProcessingTimeNs atomic.Int64
+	// maxBufferUtilization tracks peak channel utilization percentage.
+	maxBufferUtilization atomic.Int64
 }
 
 // GetFramesProcessed returns the total number of frames successfully processed.
@@ -199,6 +207,48 @@ func (m *StreamMetrics) GetReconnectAttempts() int64 {
 	return m.reconnectAttempts.Load()
 }
 
+// GetParallelFramesProcessed returns the total number of frames processed by workers.
+func (m *StreamMetrics) GetParallelFramesProcessed() int64 {
+	return m.parallelFramesProcessed.Load()
+}
+
+// GetAvgProcessingTimeMs returns the average frame processing time in milliseconds.
+func (m *StreamMetrics) GetAvgProcessingTimeMs() float64 {
+	return float64(m.avgProcessingTimeNs.Load()) / 1e6
+}
+
+// GetMaxBufferUtilization returns the peak buffer utilization as a percentage.
+func (m *StreamMetrics) GetMaxBufferUtilization() int64 {
+	return m.maxBufferUtilization.Load()
+}
+
+// UpdateProcessingTime updates the average processing time with a new measurement.
+func (m *StreamMetrics) UpdateProcessingTime(processingTime time.Duration) {
+	// Simple exponential moving average
+	current := m.avgProcessingTimeNs.Load()
+	new := int64(processingTime.Nanoseconds())
+	if current == 0 {
+		m.avgProcessingTimeNs.Store(new)
+	} else {
+		// EMA with alpha = 0.1
+		updated := int64(float64(current)*0.9 + float64(new)*0.1)
+		m.avgProcessingTimeNs.Store(updated)
+	}
+}
+
+// UpdateBufferUtilization updates the maximum buffer utilization if current is higher.
+func (m *StreamMetrics) UpdateBufferUtilization(utilization int64) {
+	for {
+		current := m.maxBufferUtilization.Load()
+		if utilization <= current {
+			break
+		}
+		if m.maxBufferUtilization.CompareAndSwap(current, utilization) {
+			break
+		}
+	}
+}
+
 // GetLastFrameAge returns how long ago the last frame was processed.
 func (m *StreamMetrics) GetLastFrameAge() time.Duration {
 	lastTime := m.lastFrameTime.Load()
@@ -208,10 +258,265 @@ func (m *StreamMetrics) GetLastFrameAge() time.Duration {
 	return time.Since(time.Unix(0, lastTime))
 }
 
-// Detector manages video stream capture and OCR processing using a concurrent pipeline.
-// It coordinates three goroutines: frame capture, OCR processing, and result logging.
+// OCRWorker represents a worker in the OCR processing pool.
+// Each worker maintains its own Tesseract client to enable parallel processing.
+type OCRWorker struct {
+	// id uniquely identifies this worker for logging and debugging.
+	id int
+	// client is the Tesseract OCR engine instance for this worker.
+	client *gosseract.Client
+	// detector is a reference to the parent detector for access to config and logger.
+	detector *Detector
+}
+
+// NewOCRWorker creates a new OCR worker with its own Tesseract client.
+// Each worker is configured with the same language and page segmentation settings.
+func NewOCRWorker(id int, detector *Detector) (*OCRWorker, error) {
+	client := gosseract.NewClient()
+	if err := client.SetLanguage(detector.config.Language); err != nil {
+		client.Close()
+		return nil, fmt.Errorf("worker %d: failed to set OCR language: %w", id, err)
+	}
+
+	if err := client.SetPageSegMode(gosseract.PSM_AUTO); err != nil {
+		client.Close()
+		return nil, fmt.Errorf("worker %d: failed to set page segmentation mode: %w", id, err)
+	}
+
+	return &OCRWorker{
+		id:       id,
+		client:   client,
+		detector: detector,
+	}, nil
+}
+
+// Close releases the OCR client resources.
+func (w *OCRWorker) Close() error {
+	if w.client != nil {
+		return w.client.Close()
+	}
+	return nil
+}
+
+// OCRWorkerPool manages a pool of OCR workers for parallel processing.
+type OCRWorkerPool struct {
+	// workers contains the pool of OCR workers.
+	workers []*OCRWorker
+	// workerCount is the number of workers in the pool.
+	workerCount int
+	// detector is a reference to the parent detector.
+	detector *Detector
+}
+
+// NewOCRWorkerPool creates a new pool of OCR workers.
+// The pool size is determined by the number of CPU cores available.
+func NewOCRWorkerPool(detector *Detector) (*OCRWorkerPool, error) {
+	// Use 2x CPU cores for optimal resource utilization
+	workerCount := runtime.NumCPU() * 2
+	if workerCount < 4 {
+		workerCount = 4 // Minimum 4 workers for good concurrency
+	}
+	if workerCount > 16 {
+		workerCount = 16 // Maximum 16 workers to prevent resource exhaustion
+	}
+
+	workers := make([]*OCRWorker, workerCount)
+	for i := 0; i < workerCount; i++ {
+		worker, err := NewOCRWorker(i, detector)
+		if err != nil {
+			// Clean up any successfully created workers
+			for j := 0; j < i; j++ {
+				workers[j].Close()
+			}
+			return nil, fmt.Errorf("failed to create worker pool: %w", err)
+		}
+		workers[i] = worker
+	}
+
+	detector.logger.Info("Created OCR worker pool", "worker_count", workerCount, "cpu_cores", runtime.NumCPU())
+
+	return &OCRWorkerPool{
+		workers:     workers,
+		workerCount: workerCount,
+		detector:    detector,
+	}, nil
+}
+
+// Close releases all worker resources.
+func (p *OCRWorkerPool) Close() error {
+	var errs []error
+	for i, worker := range p.workers {
+		if err := worker.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("worker %d: %w", i, err))
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("errors closing worker pool: %v", errs)
+	}
+	return nil
+}
+
+// ProcessFrames starts worker goroutines to process frames concurrently.
+// Each worker processes frames from the input channel and sends results to the output channel.
+func (p *OCRWorkerPool) ProcessFrames(ctx context.Context, frameChan <-chan Frame, resultChan chan<- DetectionResult) {
+	var wg sync.WaitGroup
+
+	// Start all workers
+	for _, worker := range p.workers {
+		wg.Add(1)
+		go func(w *OCRWorker) {
+			defer wg.Done()
+			w.processFrames(ctx, frameChan, resultChan)
+		}(worker)
+	}
+
+	// Wait for all workers to finish
+	wg.Wait()
+	p.detector.logger.Info("All OCR workers stopped")
+}
+
+// processFrames is the main processing loop for an individual OCR worker.
+func (w *OCRWorker) processFrames(ctx context.Context, frameChan <-chan Frame, resultChan chan<- DetectionResult) {
+	processedCount := 0
+	defer func() {
+		w.detector.logger.Info("OCR worker stopped", "worker_id", w.id, "frames_processed", processedCount)
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case frame, ok := <-frameChan:
+			if !ok {
+				return
+			}
+
+			// Process the frame with proper resource management
+			func() {
+				defer func() {
+					// Ensure frame image is always closed after processing
+					if !frame.Image.Empty() {
+						frame.Image.Close()
+					}
+				}()
+
+				startTime := time.Now()
+				result := w.processFrame(frame)
+				processingTime := time.Since(startTime)
+				
+				// Update metrics
+				w.detector.metrics.parallelFramesProcessed.Add(1)
+				w.detector.metrics.UpdateProcessingTime(processingTime)
+				processedCount++
+
+				// Forward results with matches for logging
+				if len(result.Matches) > 0 {
+					select {
+					case resultChan <- result:
+						// Result sent successfully
+					case <-ctx.Done():
+						return
+					default:
+						w.detector.logger.Warn("Dropped detection result due to full buffer",
+							"worker_id", w.id,
+							"frame_index", result.Frame.Index,
+							"matches", result.Matches)
+					}
+				}
+			}()
+		}
+	}
+}
+
+// processFrame performs OCR on a single frame using this worker's Tesseract client.
+func (w *OCRWorker) processFrame(frame Frame) DetectionResult {
+	// Preprocess the frame for better OCR accuracy
+	processed := w.detector.preprocessFrame(frame.Image)
+	defer processed.Close()
+
+	// Convert to bytes for OCR
+	imgBytes, err := gocv.IMEncode(".png", processed)
+	if err != nil {
+		w.detector.metrics.ocrErrors.Add(1)
+		w.detector.logger.Error("Failed to encode image",
+			"worker_id", w.id,
+			"error", err,
+			"frame_index", frame.Index,
+			"total_ocr_errors", w.detector.metrics.GetOCRErrors())
+		return DetectionResult{Frame: frame}
+	}
+	defer imgBytes.Close()
+
+	// Perform OCR with error recovery
+	if err := w.client.SetImageFromBytes(imgBytes.GetBytes()); err != nil {
+		w.detector.metrics.ocrErrors.Add(1)
+		w.detector.logger.Error("Failed to set OCR image",
+			"worker_id", w.id,
+			"error", err,
+			"frame_index", frame.Index,
+			"total_ocr_errors", w.detector.metrics.GetOCRErrors())
+		return DetectionResult{Frame: frame}
+	}
+
+	text, err := w.client.Text()
+	if err != nil {
+		w.detector.metrics.ocrErrors.Add(1)
+		w.detector.logger.Error("Failed to extract text",
+			"worker_id", w.id,
+			"error", err,
+			"frame_index", frame.Index,
+			"total_ocr_errors", w.detector.metrics.GetOCRErrors())
+		return DetectionResult{Frame: frame}
+	}
+
+	// Get bounding boxes to calculate average confidence
+	boxes, err := w.client.GetBoundingBoxes(gosseract.RIL_WORD)
+	if err != nil {
+		w.detector.metrics.ocrErrors.Add(1)
+		w.detector.logger.Error("Failed to get bounding boxes",
+			"worker_id", w.id,
+			"error", err,
+			"frame_index", frame.Index,
+			"total_ocr_errors", w.detector.metrics.GetOCRErrors())
+		boxes = nil
+	}
+
+	// Calculate average confidence from all detected words
+	var totalConfidence float64
+	var wordCount int
+	if boxes != nil {
+		for _, box := range boxes {
+			if box.Confidence > 0 {
+				totalConfidence += box.Confidence
+				wordCount++
+			}
+		}
+	}
+
+	var avgConfidence float64
+	if wordCount > 0 {
+		avgConfidence = totalConfidence / float64(wordCount)
+	}
+
+	// Check for word matches if confidence meets threshold or no confidence available
+	var matches []string
+	if wordCount == 0 || avgConfidence >= w.detector.config.Confidence*100 {
+		matches = w.detector.findMatches(text)
+	}
+
+	return DetectionResult{
+		Frame:      frame,
+		Text:       strings.TrimSpace(text),
+		Confidence: avgConfidence / 100.0,
+		Matches:    matches,
+	}
+}
+
+// Detector manages video stream capture and OCR processing using a high-performance concurrent pipeline.
+// It coordinates multiple goroutines: frame capture, parallel OCR processing via worker pool, and result logging.
 // All operations are thread-safe and respond to context cancellation for graceful shutdown.
-// Enhanced with circuit breaker pattern, stream reconnection, and comprehensive metrics.
+// Enhanced with circuit breaker pattern, stream reconnection, comprehensive metrics, and optimized resource utilization.
 type Detector struct {
 	// config holds the application configuration including target words,
 	// confidence thresholds, and processing intervals.
@@ -224,9 +529,8 @@ type Detector struct {
 	// Must be closed during cleanup to release system resources.
 	capture *gocv.VideoCapture
 
-	// ocrClient is the Tesseract OCR engine instance configured with
-	// the specified language and page segmentation mode.
-	ocrClient *gosseract.Client
+	// ocrWorkerPool manages the pool of OCR workers for parallel processing.
+	ocrWorkerPool *OCRWorkerPool
 
 	// frameIndex is a monotonically increasing counter for captured frames.
 	// Protected by mu for concurrent access from multiple goroutines.
@@ -252,6 +556,12 @@ type Detector struct {
 
 	// shutdownTimeout defines maximum time to wait for graceful shutdown.
 	shutdownTimeout time.Duration
+
+	// Performance optimization fields
+	// frameBufferSize is the size of the frame processing buffer
+	frameBufferSize int
+	// resultBufferSize is the size of the result processing buffer
+	resultBufferSize int
 }
 
 // NewDetector creates a new Detector instance with the given configuration.
@@ -285,34 +595,35 @@ func NewDetector(config *Config, logger *slog.Logger) (*Detector, error) {
 		return nil, fmt.Errorf("video capture is not opened")
 	}
 
-	// Initialize OCR client
-	ocrClient := gosseract.NewClient()
-	if err := ocrClient.SetLanguage(config.Language); err != nil {
-		capture.Close()
-		ocrClient.Close()
-		return nil, fmt.Errorf("failed to set OCR language: %w", err)
-	}
-
-	// Set OCR page segmentation mode for better text detection
-	if err := ocrClient.SetPageSegMode(gosseract.PSM_AUTO); err != nil {
-		capture.Close()
-		ocrClient.Close()
-		return nil, fmt.Errorf("failed to set page segmentation mode: %w", err)
-	}
-
-	// Initialize circuit breaker: 5 failures, 30s timeout, 3 successes to recover
-	circuitBreaker := NewCircuitBreaker(5, 30*time.Second, 3)
-
-	return &Detector{
+	// Initialize OCR worker pool for parallel processing
+	detector := &Detector{
 		config:                config,
 		logger:                logger,
 		capture:               capture,
-		ocrClient:             ocrClient,
-		circuitBreaker:        circuitBreaker,
+		circuitBreaker:        NewCircuitBreaker(5, 30*time.Second, 3),
 		metrics:               &StreamMetrics{},
-		backpressureThreshold: 0.8,                // Apply backpressure when channels are 80% full
-		shutdownTimeout:       10 * time.Second,   // Maximum time to wait for graceful shutdown
-	}, nil
+		backpressureThreshold: 0.7,  // Apply backpressure when channels are 70% full (more aggressive)
+		shutdownTimeout:       15 * time.Second,   // Increased timeout for worker coordination
+		// Performance optimization: larger buffers for better throughput
+		frameBufferSize:  runtime.NumCPU() * 10, // 10 frames per CPU core
+		resultBufferSize: runtime.NumCPU() * 5,  // 5 results per CPU core
+	}
+
+	// Create OCR worker pool
+	ocrWorkerPool, err := NewOCRWorkerPool(detector)
+	if err != nil {
+		capture.Close()
+		return nil, fmt.Errorf("failed to create OCR worker pool: %w", err)
+	}
+	detector.ocrWorkerPool = ocrWorkerPool
+
+	logger.Info("Detector initialized with optimized settings",
+		"frame_buffer_size", detector.frameBufferSize,
+		"result_buffer_size", detector.resultBufferSize,
+		"cpu_cores", runtime.NumCPU(),
+		"worker_count", ocrWorkerPool.workerCount)
+
+	return detector, nil
 }
 
 // Close releases all resources held by the detector.
@@ -340,6 +651,14 @@ func (d *Detector) Close() error {
 
 		var errs []error
 
+		// Close OCR worker pool first to ensure all workers stop
+		if d.ocrWorkerPool != nil {
+			if err := d.ocrWorkerPool.Close(); err != nil {
+				errs = append(errs, fmt.Errorf("failed to close OCR worker pool: %w", err))
+			}
+			d.ocrWorkerPool = nil
+		}
+
 		// Close OpenCV resources under lock to prevent races
 		d.mu.Lock()
 		if d.capture != nil {
@@ -353,17 +672,6 @@ func (d *Detector) Close() error {
 			d.capture = nil // Clear reference to prevent further access
 		}
 		d.mu.Unlock()
-
-		// Close OCR client with additional error handling
-		if d.ocrClient != nil {
-			// Defensive delay for OCR client cleanup as well
-			time.Sleep(50 * time.Millisecond)
-			
-			if err := d.ocrClient.Close(); err != nil {
-				errs = append(errs, fmt.Errorf("failed to close OCR client: %w", err))
-			}
-			d.ocrClient = nil // Clear reference to prevent further access
-		}
 
 		if len(errs) > 0 {
 			finalErr = fmt.Errorf("errors during cleanup: %v", errs)
@@ -417,9 +725,16 @@ func (d *Detector) Run(ctx context.Context) error {
 		return fmt.Errorf("detector is closed")
 	}
 
-	// Increased buffer sizes for better throughput, backpressure handles memory
-	frameChan := make(chan Frame, 20)
-	resultChan := make(chan DetectionResult, 20)
+	// Optimized buffer sizes based on CPU cores for maximum throughput
+	// Larger buffers reduce contention and improve parallel processing efficiency
+	frameChan := make(chan Frame, d.frameBufferSize)
+	resultChan := make(chan DetectionResult, d.resultBufferSize)
+
+	d.logger.Info("Starting optimized processing pipeline",
+		"frame_buffer_size", d.frameBufferSize,
+		"result_buffer_size", d.resultBufferSize,
+		"worker_count", d.ocrWorkerPool.workerCount,
+		"cpu_cores", runtime.NumCPU())
 
 	var wg sync.WaitGroup
 
@@ -438,12 +753,12 @@ func (d *Detector) Run(ctx context.Context) error {
 		d.captureFrames(ctx, frameChan)
 	}()
 
-	// Start OCR processing goroutine
+	// Start OCR worker pool for parallel processing
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		defer close(resultChan)
-		d.processFrames(ctx, frameChan, resultChan)
+		d.ocrWorkerPool.ProcessFrames(ctx, frameChan, resultChan)
 	}()
 
 	// Start result logging goroutine
@@ -570,10 +885,16 @@ func (d *Detector) reconnectStream(ctx context.Context) bool {
 // shouldApplyBackpressure determines if backpressure should be applied based on channel utilization.
 // This prevents memory exhaustion by slowing down frame capture when processing falls behind.
 //
-// Backpressure is applied when the frame channel is above the configured threshold (default 80%).
+// Backpressure is applied when the frame channel is above the configured threshold (default 70%).
 // This provides early warning before the channel becomes completely full and frames are dropped.
+// Enhanced with buffer utilization tracking for performance monitoring.
 func (d *Detector) shouldApplyBackpressure(frameChan chan<- Frame) bool {
 	utilization := float64(len(frameChan)) / float64(cap(frameChan))
+	utilizationPercent := int64(utilization * 100)
+	
+	// Update buffer utilization metrics
+	d.metrics.UpdateBufferUtilization(utilizationPercent)
+	
 	return utilization >= d.backpressureThreshold
 }
 
@@ -708,170 +1029,6 @@ func (d *Detector) captureFrames(ctx context.Context, frameChan chan<- Frame) {
 	}
 }
 
-// processFrames processes captured frames with OCR and word matching.
-// This method runs in its own goroutine and is the second stage of the processing pipeline.
-// It receives frames from the capture stage and outputs detection results.
-// Enhanced with proper error handling, metrics tracking, and resource management.
-//
-// Processing workflow for each frame:
-//   1. Apply image preprocessing (grayscale, resize, threshold)
-//   2. Perform Tesseract OCR text extraction with error recovery
-//   3. Calculate average confidence score from detected words
-//   4. If confidence meets threshold, check for target word matches
-//   5. Send results to logging stage (only frames with matches)
-//   6. Update processing metrics for monitoring
-//
-// Memory management: Uses anonymous function with defer to guarantee OpenCV Mat cleanup
-// even on panic conditions. The frame image is always closed after processing completes.
-// This prevents memory leaks and segmentation faults during shutdown scenarios.
-// Results are only forwarded if target words are detected to reduce logging volume.
-//
-// Error handling: OCR failures are logged with frame context and metrics updated.
-// Processing continues despite individual frame issues for robust operation.
-// Panic recovery ensures the goroutine remains stable under all conditions.
-func (d *Detector) processFrames(ctx context.Context, frameChan <-chan Frame, resultChan chan<- DetectionResult) {
-	for {
-		select {
-		case <-ctx.Done():
-			d.logger.Info("Frame processing stopped")
-			return
-		case frame, ok := <-frameChan:
-			if !ok {
-				return
-			}
-
-			// Process the frame with proper resource management
-			// Use defer to ensure cleanup even on panic
-			func() {
-				defer func() {
-					// Ensure frame image is always closed after processing
-					if !frame.Image.Empty() {
-						frame.Image.Close()
-					}
-				}()
-				
-				result := d.processFrame(frame)
-				
-				// Forward results with matches or high confidence for logging
-				if len(result.Matches) > 0 {
-					select {
-					case resultChan <- result:
-						// Result sent successfully
-					case <-ctx.Done():
-						return
-					default:
-						d.logger.Warn("Dropped detection result due to full buffer",
-							"frame_index", result.Frame.Index,
-							"matches", result.Matches)
-					}
-				}
-			}()
-		}
-	}
-}
-
-// processFrame performs OCR on a single frame and checks for word matches.
-// This is the core processing logic that transforms video frames into text detection results.
-// Enhanced with comprehensive error handling, metrics tracking, and resource management.
-//
-// Processing steps:
-//   1. Apply image preprocessing (grayscale conversion, resize, adaptive threshold)
-//   2. Encode preprocessed image as PNG for Tesseract input
-//   3. Extract text using configured OCR language settings with error recovery
-//   4. Retrieve word-level bounding boxes with confidence scores
-//   5. Calculate average confidence across all detected words
-//   6. If confidence ≥ threshold, perform case-insensitive target word matching
-//   7. Update OCR processing metrics for monitoring
-//
-// Confidence calculation: Uses the average confidence of all detected words
-// with confidence > 0. This provides a more stable metric than individual
-// word confidence scores which can vary significantly.
-//
-// Returns a DetectionResult with the original frame metadata, extracted text,
-// calculated confidence, and any matched target words. Empty matches indicate
-// either no target words found or confidence below threshold.
-//
-// Error recovery: OCR failures are tracked in metrics but don't crash processing.
-// Resource cleanup is guaranteed through defer statements.
-func (d *Detector) processFrame(frame Frame) DetectionResult {
-	// Preprocess the frame for better OCR accuracy
-	processed := d.preprocessFrame(frame.Image)
-	defer processed.Close()
-
-	// Convert to bytes for OCR
-	imgBytes, err := gocv.IMEncode(".png", processed)
-	if err != nil {
-		d.metrics.ocrErrors.Add(1)
-		d.logger.Error("Failed to encode image",
-			"error", err,
-			"frame_index", frame.Index,
-			"total_ocr_errors", d.metrics.GetOCRErrors())
-		return DetectionResult{Frame: frame}
-	}
-	defer imgBytes.Close() // Ensure encoded bytes are cleaned up
-
-	// Perform OCR with error recovery
-	if err := d.ocrClient.SetImageFromBytes(imgBytes.GetBytes()); err != nil {
-		d.metrics.ocrErrors.Add(1)
-		d.logger.Error("Failed to set OCR image",
-			"error", err,
-			"frame_index", frame.Index,
-			"total_ocr_errors", d.metrics.GetOCRErrors())
-		return DetectionResult{Frame: frame}
-	}
-
-	text, err := d.ocrClient.Text()
-	if err != nil {
-		d.metrics.ocrErrors.Add(1)
-		d.logger.Error("Failed to extract text",
-			"error", err,
-			"frame_index", frame.Index,
-			"total_ocr_errors", d.metrics.GetOCRErrors())
-		return DetectionResult{Frame: frame}
-	}
-
-	// Get bounding boxes to calculate average confidence
-	boxes, err := d.ocrClient.GetBoundingBoxes(gosseract.RIL_WORD)
-	if err != nil {
-		d.metrics.ocrErrors.Add(1)
-		d.logger.Error("Failed to get bounding boxes",
-			"error", err,
-			"frame_index", frame.Index,
-			"total_ocr_errors", d.metrics.GetOCRErrors())
-		// Continue without confidence calculation if bounding boxes fail
-		boxes = nil
-	}
-
-	// Calculate average confidence from all detected words
-	var totalConfidence float64
-	var wordCount int
-	if boxes != nil {
-		for _, box := range boxes {
-			if box.Confidence > 0 {
-				totalConfidence += box.Confidence
-				wordCount++
-			}
-		}
-	}
-
-	var avgConfidence float64
-	if wordCount > 0 {
-		avgConfidence = totalConfidence / float64(wordCount)
-	}
-
-	// Check for word matches if confidence meets threshold or no confidence available
-	var matches []string
-	if wordCount == 0 || avgConfidence >= d.config.Confidence*100 {
-		matches = d.findMatches(text)
-	}
-
-	return DetectionResult{
-		Frame:      frame,
-		Text:       strings.TrimSpace(text),
-		Confidence: avgConfidence / 100.0,
-		Matches:    matches,
-	}
-}
 
 // reportMetrics periodically logs stream health and performance metrics.
 // This method runs in its own goroutine and provides visibility into stream quality,
@@ -897,22 +1054,53 @@ func (d *Detector) reportMetrics(ctx context.Context) {
 		case <-ticker.C:
 			lastFrameAge := d.metrics.GetLastFrameAge()
 			circuitState := d.circuitBreaker.GetState()
+			avgProcessingTime := d.metrics.GetAvgProcessingTimeMs()
+			maxBufferUtil := d.metrics.GetMaxBufferUtilization()
+			parallelFrames := d.metrics.GetParallelFramesProcessed()
 
-			d.logger.Info("Stream metrics report",
+			d.logger.Info("Enhanced stream metrics report",
 				"frames_processed", d.metrics.GetFramesProcessed(),
+				"parallel_frames_processed", parallelFrames,
 				"frames_dropped", d.metrics.GetFramesDropped(),
 				"stream_errors", d.metrics.GetStreamErrors(),
 				"ocr_errors", d.metrics.GetOCRErrors(),
 				"reconnect_attempts", d.metrics.GetReconnectAttempts(),
 				"last_frame_age_ms", lastFrameAge.Milliseconds(),
+				"avg_processing_time_ms", avgProcessingTime,
+				"max_buffer_utilization_pct", maxBufferUtil,
+				"worker_count", d.ocrWorkerPool.workerCount,
+				"frame_buffer_size", d.frameBufferSize,
+				"result_buffer_size", d.resultBufferSize,
 				"circuit_state", circuitState,
 				"stream_url", d.config.URL)
+
+			// Calculate and log performance statistics
+			if parallelFrames > 0 {
+				processingRate := float64(parallelFrames) / 30.0 // frames per second over 30s interval
+				d.logger.Info("Performance statistics",
+					"processing_rate_fps", processingRate,
+					"cpu_cores", runtime.NumCPU(),
+					"goroutines", runtime.NumGoroutine())
+			}
 
 			// Log warning if frames haven't been processed recently
 			if lastFrameAge > 5*d.config.Interval {
 				d.logger.Warn("Stream processing may be stalled",
 					"last_frame_age", lastFrameAge,
 					"expected_interval", d.config.Interval)
+			}
+
+			// Log performance warnings
+			if maxBufferUtil > 90 {
+				d.logger.Warn("High buffer utilization detected",
+					"max_utilization_pct", maxBufferUtil,
+					"consider_increasing_workers", true)
+			}
+
+			if avgProcessingTime > 200 { // 200ms is quite slow for OCR
+				d.logger.Warn("Slow OCR processing detected",
+					"avg_processing_time_ms", avgProcessingTime,
+					"consider_optimization", true)
 			}
 		}
 	}

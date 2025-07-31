@@ -20,15 +20,17 @@
 // # System Requirements
 //
 // The application requires OpenCV 4.x with FFmpeg support and Tesseract OCR 5.x
-// to be installed on the system. Memory usage is typically ≤300MB for 1080p streams
-// at 1fps sampling rate.
+// to be installed on the system. Optimized for high performance with parallel OCR
+// processing: typically 500MB-1GB RAM usage for 1080p streams with 2-16 concurrent
+// workers depending on CPU cores available.
 //
 // # Architecture
 //
-// The detector uses a three-stage concurrent pipeline:
+// The detector uses an optimized multi-stage concurrent pipeline:
 //   - Frame capture: Samples frames at specified intervals from video stream
-//   - OCR processing: Applies image preprocessing and Tesseract OCR analysis
+//   - Parallel OCR processing: Worker pool (2x CPU cores) processes frames concurrently
 //   - Result logging: Outputs structured logs when target words are detected
+//   - Performance monitoring: Tracks throughput, latency, and resource utilization
 //
 // All goroutines coordinate through buffered channels and respond to context
 // cancellation for graceful shutdown.

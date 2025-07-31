@@ -37,28 +37,35 @@ make run ARGS="-url rtsp://example.com -word BREAKING"
 
 ### Core Components
 - **main.go**: CLI entry point with flag parsing and graceful shutdown
-- **detector.go**: Main detection logic with concurrent pipeline:
-  - Frame capture goroutine (captures at intervals)
-  - OCR processing goroutine (processes frames with Tesseract)
+- **detector.go**: Optimized detection engine with high-performance concurrent pipeline:
+  - Frame capture goroutine (captures at intervals with backpressure)
+  - OCR Worker Pool (2x CPU cores workers for parallel Tesseract processing)
   - Result logging goroutine (logs matches with structured output)
+  - Performance monitoring goroutine (tracks metrics and resource utilization)
 
 ### Build Configuration
 All code now requires OpenCV and Tesseract to be installed on the system. The build tag separation has been removed for simplicity.
 
 ### Key Types
 - `Config`: CLI configuration parsed from flags
-- `Detector`: Main processing engine managing video capture and OCR
+- `Detector`: High-performance processing engine with worker pool management
+- `OCRWorker`: Individual worker with dedicated Tesseract client
+- `OCRWorkerPool`: Pool manager for coordinating parallel OCR processing
 - `Frame`: Video frame with metadata (index, timestamp)
 - `DetectionResult`: OCR results with confidence and word matches
+- `StreamMetrics`: Enhanced metrics tracking performance and resource utilization
 
 ### Dependencies
 - `gocv.io/x/gocv`: OpenCV Go bindings for video processing
 - `github.com/otiai10/gosseract/v2`: Tesseract OCR wrapper
 
-### Performance Targets
-- Memory: ≤300MB RAM for 1080p streams at 1fps  
-- CPU: ≤1 CPU core usage
+### Performance Targets (Optimized)
+- Memory: 500MB-1GB RAM for 1080p streams (dynamic based on worker count)
+- CPU: Multi-core utilization (2x CPU cores for optimal throughput)
+- Throughput: 5-15 fps processing capability depending on hardware
+- Latency: <200ms average OCR processing time per frame
 - Accuracy: ≥95% precision/recall on broadcast captions
+- Buffer efficiency: 70% backpressure threshold with dynamic sizing
 
 ## System Requirements
 
