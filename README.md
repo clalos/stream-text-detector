@@ -89,7 +89,7 @@ go build -o std .
   -url rtsp://camera.example.com/live \
   -word "BREAKING,URGENT,ALERT" \
   -interval 2s \
-  -lang eng,ita \
+  -lang eng+ita \
   -confidence 0.85 \
   -logfmt json
 ```
@@ -101,7 +101,7 @@ go build -o std .
 | `-url`        | string   | —       | RTSP/HTTP(S) video stream source (required)   |
 | `-word`       | string   | —       | Target word(s) to detect, comma-separated (required) |
 | `-interval`   | duration | `1s`    | Frame sampling interval                        |
-| `-lang`       | string   | `eng`   | Tesseract language codes, comma-separated     |
+| `-lang`       | string   | `eng`   | Tesseract language codes, plus-separated (e.g., eng+ita) |
 | `-confidence` | float    | `0.80`  | Minimum OCR confidence (0.0-1.0)             |
 | `-logfmt`     | enum     | `json`  | Log format: `json` or `kv`                    |
 
