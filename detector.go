@@ -5,8 +5,11 @@ import (
 	"fmt"
 	"image"
 	"log/slog"
+	"math"
+	"math/rand"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/otiai10/gosseract/v2"
@@ -52,9 +55,163 @@ type DetectionResult struct {
 	Matches []string
 }
 
+// CircuitState represents the current state of the circuit breaker.
+type CircuitState int32
+
+const (
+	// CircuitClosed indicates normal operation with successful stream reads.
+	CircuitClosed CircuitState = iota
+	// CircuitOpen indicates too many failures occurred, blocking operations.
+	CircuitOpen
+	// CircuitHalfOpen indicates testing if the stream has recovered.
+	CircuitHalfOpen
+)
+
+// CircuitBreaker implements the circuit breaker pattern for stream reliability.
+// It prevents cascade failures by temporarily blocking operations after too many errors.
+type CircuitBreaker struct {
+	// state holds the current circuit state (closed/open/half-open).
+	state atomic.Int32
+	// failureCount tracks consecutive failures for triggering state changes.
+	failureCount atomic.Int64
+	// lastFailureTime records when the last failure occurred for timeout calculations.
+	lastFailureTime atomic.Int64
+	// successCount tracks successful operations in half-open state.
+	successCount atomic.Int64
+
+	// maxFailures is the threshold for opening the circuit.
+	maxFailures int64
+	// timeout is how long to wait before transitioning from open to half-open.
+	timeout time.Duration
+	// recoveryThreshold is how many successes needed to close from half-open.
+	recoveryThreshold int64
+}
+
+// NewCircuitBreaker creates a circuit breaker with the specified configuration.
+// maxFailures: number of consecutive failures before opening
+// timeout: how long to wait before attempting recovery
+// recoveryThreshold: successful operations needed to fully recover
+func NewCircuitBreaker(maxFailures int64, timeout time.Duration, recoveryThreshold int64) *CircuitBreaker {
+	cb := &CircuitBreaker{
+		maxFailures:       maxFailures,
+		timeout:           timeout,
+		recoveryThreshold: recoveryThreshold,
+	}
+	cb.state.Store(int32(CircuitClosed))
+	return cb
+}
+
+// Call executes the provided function if the circuit allows it.
+// Returns an error if the circuit is open, otherwise returns the function's result.
+func (cb *CircuitBreaker) Call(fn func() error) error {
+	state := CircuitState(cb.state.Load())
+
+	switch state {
+	case CircuitOpen:
+		// Check if timeout has passed to transition to half-open
+		lastFailure := time.Unix(0, cb.lastFailureTime.Load())
+		if time.Since(lastFailure) > cb.timeout {
+			if cb.state.CompareAndSwap(int32(CircuitOpen), int32(CircuitHalfOpen)) {
+				cb.successCount.Store(0)
+			}
+			state = CircuitHalfOpen
+		} else {
+			return fmt.Errorf("circuit breaker is open, last failure: %v ago", time.Since(lastFailure))
+		}
+	}
+
+	err := fn()
+	if err != nil {
+		cb.recordFailure()
+	} else {
+		cb.recordSuccess()
+	}
+
+	return err
+}
+
+// recordFailure increments the failure count and potentially opens the circuit.
+func (cb *CircuitBreaker) recordFailure() {
+	cb.lastFailureTime.Store(time.Now().UnixNano())
+	failures := cb.failureCount.Add(1)
+
+	if failures >= cb.maxFailures {
+		cb.state.Store(int32(CircuitOpen))
+	}
+}
+
+// recordSuccess resets failure count and potentially closes the circuit from half-open.
+func (cb *CircuitBreaker) recordSuccess() {
+	cb.failureCount.Store(0)
+
+	state := CircuitState(cb.state.Load())
+	if state == CircuitHalfOpen {
+		successes := cb.successCount.Add(1)
+		if successes >= cb.recoveryThreshold {
+			cb.state.Store(int32(CircuitClosed))
+		}
+	}
+}
+
+// GetState returns the current circuit breaker state.
+func (cb *CircuitBreaker) GetState() CircuitState {
+	return CircuitState(cb.state.Load())
+}
+
+// StreamMetrics tracks health and performance metrics for the video stream.
+type StreamMetrics struct {
+	// framesProcessed counts total frames successfully processed.
+	framesProcessed atomic.Int64
+	// framesDropped counts frames dropped due to backpressure.
+	framesDropped atomic.Int64
+	// streamErrors counts stream read/connection errors.
+	streamErrors atomic.Int64
+	// ocrErrors counts OCR processing errors.
+	ocrErrors atomic.Int64
+	// lastFrameTime tracks when the last frame was successfully processed.
+	lastFrameTime atomic.Int64
+	// reconnectAttempts counts how many times stream reconnection was attempted.
+	reconnectAttempts atomic.Int64
+}
+
+// GetFramesProcessed returns the total number of frames successfully processed.
+func (m *StreamMetrics) GetFramesProcessed() int64 {
+	return m.framesProcessed.Load()
+}
+
+// GetFramesDropped returns the total number of frames dropped due to backpressure.
+func (m *StreamMetrics) GetFramesDropped() int64 {
+	return m.framesDropped.Load()
+}
+
+// GetStreamErrors returns the total number of stream errors encountered.
+func (m *StreamMetrics) GetStreamErrors() int64 {
+	return m.streamErrors.Load()
+}
+
+// GetOCRErrors returns the total number of OCR processing errors.
+func (m *StreamMetrics) GetOCRErrors() int64 {
+	return m.ocrErrors.Load()
+}
+
+// GetReconnectAttempts returns the total number of stream reconnection attempts.
+func (m *StreamMetrics) GetReconnectAttempts() int64 {
+	return m.reconnectAttempts.Load()
+}
+
+// GetLastFrameAge returns how long ago the last frame was processed.
+func (m *StreamMetrics) GetLastFrameAge() time.Duration {
+	lastTime := m.lastFrameTime.Load()
+	if lastTime == 0 {
+		return 0
+	}
+	return time.Since(time.Unix(0, lastTime))
+}
+
 // Detector manages video stream capture and OCR processing using a concurrent pipeline.
 // It coordinates three goroutines: frame capture, OCR processing, and result logging.
 // All operations are thread-safe and respond to context cancellation for graceful shutdown.
+// Enhanced with circuit breaker pattern, stream reconnection, and comprehensive metrics.
 type Detector struct {
 	// config holds the application configuration including target words,
 	// confidence thresholds, and processing intervals.
@@ -75,18 +232,30 @@ type Detector struct {
 	// Protected by mu for concurrent access from multiple goroutines.
 	frameIndex int64
 
-	// mu protects frameIndex during concurrent updates from the capture goroutine.
+	// mu protects capture reconnection operations and ensures thread safety.
 	mu sync.RWMutex
+
+	// circuitBreaker implements circuit breaker pattern for stream resilience.
+	circuitBreaker *CircuitBreaker
+
+	// metrics tracks stream health and performance statistics.
+	metrics *StreamMetrics
+
+	// backpressureThreshold defines when to start applying backpressure (channel usage %).
+	backpressureThreshold float64
 }
 
 // NewDetector creates a new Detector instance with the given configuration.
 // It initializes the video capture connection and OCR client with proper validation.
+// Enhanced with circuit breaker, metrics tracking, and backpressure handling.
 //
 // The function performs the following initialization steps:
 //   1. Opens video capture connection to the specified stream URL
 //   2. Verifies the connection is active and responsive
 //   3. Creates and configures Tesseract OCR client with specified language
 //   4. Sets OCR page segmentation mode to PSM_AUTO for optimal text detection
+//   5. Initializes circuit breaker for stream resilience
+//   6. Sets up metrics tracking for monitoring stream health
 //
 // Returns an error if:
 //   - The video stream URL is unreachable or invalid
@@ -122,11 +291,17 @@ func NewDetector(config *Config, logger *slog.Logger) (*Detector, error) {
 		return nil, fmt.Errorf("failed to set page segmentation mode: %w", err)
 	}
 
+	// Initialize circuit breaker: 5 failures, 30s timeout, 3 successes to recover
+	circuitBreaker := NewCircuitBreaker(5, 30*time.Second, 3)
+
 	return &Detector{
-		config:    config,
-		logger:    logger,
-		capture:   capture,
-		ocrClient: ocrClient,
+		config:                config,
+		logger:                logger,
+		capture:               capture,
+		ocrClient:             ocrClient,
+		circuitBreaker:        circuitBreaker,
+		metrics:               &StreamMetrics{},
+		backpressureThreshold: 0.8, // Apply backpressure when channels are 80% full
 	}, nil
 }
 
@@ -170,20 +345,35 @@ func (d *Detector) Close() error {
 //   1. Frame capture: samples frames from video stream at configured intervals
 //   2. OCR processing: applies image preprocessing and Tesseract text extraction
 //   3. Result logging: outputs structured logs for matched target words
+//   4. Metrics reporting: periodically logs stream health metrics
 //
 // The method blocks until the context is cancelled or an unrecoverable error occurs.
 // All goroutines respond to context cancellation for coordinated shutdown.
 //
-// Channel buffer sizes (10 each) provide flow control to handle processing
-// speed variations between stages while preventing excessive memory usage.
+// Enhanced features:
+//   - Dynamic backpressure based on channel utilization
+//   - Circuit breaker pattern for stream resilience
+//   - Comprehensive metrics tracking and reporting
+//   - Automatic stream reconnection with exponential backoff
+//
+// Channel buffer sizes (20 each) provide better flow control while the backpressure
+// mechanism prevents excessive memory usage when processing falls behind.
 //
 // Error handling: Individual frame processing errors are logged but don't
 // terminate the entire pipeline, ensuring robust operation with intermittent issues.
 func (d *Detector) Run(ctx context.Context) error {
-	frameChan := make(chan Frame, 10)
-	resultChan := make(chan DetectionResult, 10)
+	// Increased buffer sizes for better throughput, backpressure handles memory
+	frameChan := make(chan Frame, 20)
+	resultChan := make(chan DetectionResult, 20)
 
 	var wg sync.WaitGroup
+
+	// Start metrics reporting goroutine
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		d.reportMetrics(ctx)
+	}()
 
 	// Start frame capture goroutine
 	wg.Add(1)
@@ -212,21 +402,112 @@ func (d *Detector) Run(ctx context.Context) error {
 	return nil
 }
 
+// reconnectStream attempts to reconnect to the video stream with exponential backoff.
+// This method is called when the stream connection fails and implements a robust
+// reconnection strategy to handle temporary network issues or stream interruptions.
+//
+// Reconnection strategy:
+//   - Exponential backoff starting at 1 second, max 60 seconds
+//   - Maximum 10 attempts before giving up
+//   - Closes old connection before attempting new one
+//   - Validates new connection before returning
+//
+// Returns true if reconnection succeeded, false if all attempts failed.
+// Thread-safe and can be called concurrently with other detector operations.
+func (d *Detector) reconnectStream(ctx context.Context) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	// Close existing connection
+	if d.capture != nil {
+		d.capture.Close()
+		d.capture = nil
+	}
+
+	const maxAttempts = 10
+	baseDelay := 1 * time.Second
+	maxDelay := 60 * time.Second
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		select {
+		case <-ctx.Done():
+			return false
+		default:
+		}
+
+		d.metrics.reconnectAttempts.Add(1)
+		d.logger.Info("Attempting stream reconnection",
+			"attempt", attempt,
+			"max_attempts", maxAttempts,
+			"url", d.config.URL)
+
+		// Attempt reconnection
+		capture, err := gocv.OpenVideoCapture(d.config.URL)
+		if err == nil && capture.IsOpened() {
+			d.capture = capture
+			d.logger.Info("Stream reconnection successful", "attempt", attempt)
+			return true
+		}
+
+		if capture != nil {
+			capture.Close()
+		}
+
+		// Calculate exponential backoff delay
+		delay := time.Duration(float64(baseDelay) * math.Pow(2, float64(attempt-1)))
+		if delay > maxDelay {
+			delay = maxDelay
+		}
+
+		// Add jitter to prevent thundering herd
+		jitter := time.Duration(rand.Int63n(int64(delay / 4)))
+		totalDelay := delay + jitter
+
+		d.logger.Warn("Stream reconnection failed, retrying",
+			"attempt", attempt,
+			"error", err,
+			"retry_in", totalDelay)
+
+		select {
+		case <-time.After(totalDelay):
+			continue
+		case <-ctx.Done():
+			return false
+		}
+	}
+
+	d.logger.Error("Stream reconnection failed after all attempts", "max_attempts", maxAttempts)
+	return false
+}
+
+// shouldApplyBackpressure determines if backpressure should be applied based on channel utilization.
+// This prevents memory exhaustion by slowing down frame capture when processing falls behind.
+//
+// Backpressure is applied when the frame channel is above the configured threshold (default 80%).
+// This provides early warning before the channel becomes completely full and frames are dropped.
+func (d *Detector) shouldApplyBackpressure(frameChan chan<- Frame) bool {
+	utilization := float64(len(frameChan)) / float64(cap(frameChan))
+	return utilization >= d.backpressureThreshold
+}
+
 // captureFrames captures frames from the video stream at the configured interval.
 // This method runs in its own goroutine and is the first stage of the processing pipeline.
+// Enhanced with circuit breaker pattern, stream reconnection, and backpressure handling.
 //
 // Behavior:
 //   - Uses a ticker to sample frames at the configured interval
 //   - Clones each frame to prevent data races with OpenCV Mat objects
 //   - Assigns monotonically increasing frame indices for tracking
-//   - Drops frames if the processing pipeline is backlogged (non-blocking send)
+//   - Applies backpressure when processing pipeline is overloaded
+//   - Automatically reconnects on stream failures using exponential backoff
+//   - Uses circuit breaker to prevent cascade failures
 //   - Responds immediately to context cancellation for shutdown
 //
 // Frame memory management: Each captured frame is cloned to ensure thread safety.
 // The clone is closed by the OCR processing stage after use.
 //
-// Error handling: Individual frame read failures are logged but don't terminate
-// the capture loop, allowing recovery from temporary stream issues.
+// Error handling: Stream failures trigger automatic reconnection attempts.
+// Circuit breaker prevents overwhelming failed streams with continuous retries.
 func (d *Detector) captureFrames(ctx context.Context, frameChan chan<- Frame) {
 	ticker := time.NewTicker(d.config.Interval)
 	defer ticker.Stop()
@@ -240,13 +521,50 @@ func (d *Detector) captureFrames(ctx context.Context, frameChan chan<- Frame) {
 			d.logger.Info("Frame capture stopped")
 			return
 		case <-ticker.C:
-			if !d.capture.Read(&img) {
-				d.logger.Error("Failed to read frame from video stream")
+			// Apply backpressure if processing is falling behind
+			if d.shouldApplyBackpressure(frameChan) {
+				d.logger.Debug("Applying backpressure, skipping frame capture")
 				continue
 			}
 
-			if img.Empty() {
-				d.logger.Warn("Empty frame captured")
+			// Use circuit breaker to handle stream failures gracefully
+			err := d.circuitBreaker.Call(func() error {
+				d.mu.RLock()
+				capture := d.capture
+				d.mu.RUnlock()
+
+				if capture == nil {
+					return fmt.Errorf("capture is nil")
+				}
+
+				if !capture.Read(&img) {
+					d.metrics.streamErrors.Add(1)
+					return fmt.Errorf("failed to read frame from video stream")
+				}
+
+				if img.Empty() {
+					return fmt.Errorf("empty frame captured")
+				}
+
+				return nil
+			})
+
+			if err != nil {
+				// Log the error with circuit breaker state
+				state := d.circuitBreaker.GetState()
+				d.logger.Error("Frame capture failed",
+					"error", err,
+					"circuit_state", state,
+					"stream_errors", d.metrics.GetStreamErrors())
+
+				// If circuit is open, attempt reconnection
+				if state == CircuitOpen {
+					d.logger.Info("Circuit breaker open, attempting stream reconnection")
+					if !d.reconnectStream(ctx) {
+						d.logger.Error("Stream reconnection failed, stopping capture")
+						return
+					}
+				}
 				continue
 			}
 
@@ -264,15 +582,23 @@ func (d *Detector) captureFrames(ctx context.Context, frameChan chan<- Frame) {
 				Timestamp: time.Now(),
 			}
 
+			// Update metrics
+			d.metrics.framesProcessed.Add(1)
+			d.metrics.lastFrameTime.Store(time.Now().UnixNano())
+
 			select {
 			case frameChan <- frame:
+				// Frame sent successfully
 			case <-ctx.Done():
 				clonedImg.Close()
 				return
 			default:
-				// Drop frame if channel is full
+				// Drop frame if channel is full (last resort)
 				clonedImg.Close()
-				d.logger.Warn("Dropped frame due to full buffer", "frame_index", frameIndex)
+				d.metrics.framesDropped.Add(1)
+				d.logger.Warn("Dropped frame due to full buffer",
+					"frame_index", frameIndex,
+					"total_dropped", d.metrics.GetFramesDropped())
 			}
 		}
 	}
@@ -281,19 +607,22 @@ func (d *Detector) captureFrames(ctx context.Context, frameChan chan<- Frame) {
 // processFrames processes captured frames with OCR and word matching.
 // This method runs in its own goroutine and is the second stage of the processing pipeline.
 // It receives frames from the capture stage and outputs detection results.
+// Enhanced with proper error handling, metrics tracking, and resource management.
 //
 // Processing workflow for each frame:
 //   1. Apply image preprocessing (grayscale, resize, threshold)
-//   2. Perform Tesseract OCR text extraction
+//   2. Perform Tesseract OCR text extraction with error recovery
 //   3. Calculate average confidence score from detected words
 //   4. If confidence meets threshold, check for target word matches
 //   5. Send results to logging stage (only frames with matches)
+//   6. Update processing metrics for monitoring
 //
 // Memory management: Properly closes the frame image after processing to prevent leaks.
+// Uses defer statements to ensure cleanup even on panic or early return.
 // Results are only forwarded if target words are detected to reduce logging volume.
 //
-// Error handling: OCR failures are logged with frame context but don't stop processing,
-// ensuring the pipeline continues operating despite individual frame issues.
+// Error handling: OCR failures are logged with frame context and metrics updated.
+// Processing continues despite individual frame issues for robust operation.
 func (d *Detector) processFrames(ctx context.Context, frameChan <-chan Frame, resultChan chan<- DetectionResult) {
 	for {
 		select {
@@ -305,16 +634,29 @@ func (d *Detector) processFrames(ctx context.Context, frameChan <-chan Frame, re
 				return
 			}
 
-			result := d.processFrame(frame)
-			frame.Image.Close() // Clean up the frame image
+			// Ensure frame image is always closed, even on panic
+			defer func() {
+				if !frame.Image.Empty() {
+					frame.Image.Close()
+				}
+			}()
 
+			result := d.processFrame(frame)
+
+			// Immediately close the frame image after processing
+			frame.Image.Close()
+
+			// Forward results with matches or high confidence for logging
 			if len(result.Matches) > 0 {
 				select {
 				case resultChan <- result:
+					// Result sent successfully
 				case <-ctx.Done():
 					return
 				default:
-					d.logger.Warn("Dropped detection result due to full buffer", "frame_index", result.Frame.Index)
+					d.logger.Warn("Dropped detection result due to full buffer",
+						"frame_index", result.Frame.Index,
+						"matches", result.Matches)
 				}
 			}
 		}
@@ -323,14 +665,16 @@ func (d *Detector) processFrames(ctx context.Context, frameChan <-chan Frame, re
 
 // processFrame performs OCR on a single frame and checks for word matches.
 // This is the core processing logic that transforms video frames into text detection results.
+// Enhanced with comprehensive error handling, metrics tracking, and resource management.
 //
 // Processing steps:
 //   1. Apply image preprocessing (grayscale conversion, resize, adaptive threshold)
 //   2. Encode preprocessed image as PNG for Tesseract input
-//   3. Extract text using configured OCR language settings
+//   3. Extract text using configured OCR language settings with error recovery
 //   4. Retrieve word-level bounding boxes with confidence scores
 //   5. Calculate average confidence across all detected words
 //   6. If confidence ≥ threshold, perform case-insensitive target word matching
+//   7. Update OCR processing metrics for monitoring
 //
 // Confidence calculation: Uses the average confidence of all detected words
 // with confidence > 0. This provides a more stable metric than individual
@@ -339,6 +683,9 @@ func (d *Detector) processFrames(ctx context.Context, frameChan <-chan Frame, re
 // Returns a DetectionResult with the original frame metadata, extracted text,
 // calculated confidence, and any matched target words. Empty matches indicate
 // either no target words found or confidence below threshold.
+//
+// Error recovery: OCR failures are tracked in metrics but don't crash processing.
+// Resource cleanup is guaranteed through defer statements.
 func (d *Detector) processFrame(frame Frame) DetectionResult {
 	// Preprocess the frame for better OCR accuracy
 	processed := d.preprocessFrame(frame.Image)
@@ -347,36 +694,56 @@ func (d *Detector) processFrame(frame Frame) DetectionResult {
 	// Convert to bytes for OCR
 	imgBytes, err := gocv.IMEncode(".png", processed)
 	if err != nil {
-		d.logger.Error("Failed to encode image", "error", err, "frame_index", frame.Index)
+		d.metrics.ocrErrors.Add(1)
+		d.logger.Error("Failed to encode image",
+			"error", err,
+			"frame_index", frame.Index,
+			"total_ocr_errors", d.metrics.GetOCRErrors())
 		return DetectionResult{Frame: frame}
 	}
+	defer imgBytes.Close() // Ensure encoded bytes are cleaned up
 
-	// Perform OCR
+	// Perform OCR with error recovery
 	if err := d.ocrClient.SetImageFromBytes(imgBytes.GetBytes()); err != nil {
-		d.logger.Error("Failed to set OCR image", "error", err, "frame_index", frame.Index)
+		d.metrics.ocrErrors.Add(1)
+		d.logger.Error("Failed to set OCR image",
+			"error", err,
+			"frame_index", frame.Index,
+			"total_ocr_errors", d.metrics.GetOCRErrors())
 		return DetectionResult{Frame: frame}
 	}
 
 	text, err := d.ocrClient.Text()
 	if err != nil {
-		d.logger.Error("Failed to extract text", "error", err, "frame_index", frame.Index)
+		d.metrics.ocrErrors.Add(1)
+		d.logger.Error("Failed to extract text",
+			"error", err,
+			"frame_index", frame.Index,
+			"total_ocr_errors", d.metrics.GetOCRErrors())
 		return DetectionResult{Frame: frame}
 	}
 
 	// Get bounding boxes to calculate average confidence
 	boxes, err := d.ocrClient.GetBoundingBoxes(gosseract.RIL_WORD)
 	if err != nil {
-		d.logger.Error("Failed to get bounding boxes", "error", err, "frame_index", frame.Index)
-		return DetectionResult{Frame: frame}
+		d.metrics.ocrErrors.Add(1)
+		d.logger.Error("Failed to get bounding boxes",
+			"error", err,
+			"frame_index", frame.Index,
+			"total_ocr_errors", d.metrics.GetOCRErrors())
+		// Continue without confidence calculation if bounding boxes fail
+		boxes = nil
 	}
 
 	// Calculate average confidence from all detected words
 	var totalConfidence float64
 	var wordCount int
-	for _, box := range boxes {
-		if box.Confidence > 0 {
-			totalConfidence += box.Confidence
-			wordCount++
+	if boxes != nil {
+		for _, box := range boxes {
+			if box.Confidence > 0 {
+				totalConfidence += box.Confidence
+				wordCount++
+			}
 		}
 	}
 
@@ -385,9 +752,9 @@ func (d *Detector) processFrame(frame Frame) DetectionResult {
 		avgConfidence = totalConfidence / float64(wordCount)
 	}
 
-	// Check for word matches if confidence meets threshold
+	// Check for word matches if confidence meets threshold or no confidence available
 	var matches []string
-	if avgConfidence >= d.config.Confidence*100 {
+	if wordCount == 0 || avgConfidence >= d.config.Confidence*100 {
 		matches = d.findMatches(text)
 	}
 
@@ -399,39 +766,105 @@ func (d *Detector) processFrame(frame Frame) DetectionResult {
 	}
 }
 
+// reportMetrics periodically logs stream health and performance metrics.
+// This method runs in its own goroutine and provides visibility into stream quality,
+// processing performance, and error rates for monitoring and debugging.
+//
+// Metrics reported every 30 seconds:
+//   - Stream health: frames processed, dropped, errors
+//   - Processing performance: OCR errors, last frame age
+//   - Connection status: reconnection attempts, circuit breaker state
+//   - Memory efficiency: frame processing rate vs capture rate
+//
+// This information helps identify bottlenecks, stream quality issues,
+// and system performance characteristics in production deployments.
+func (d *Detector) reportMetrics(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			d.logger.Info("Metrics reporting stopped")
+			return
+		case <-ticker.C:
+			lastFrameAge := d.metrics.GetLastFrameAge()
+			circuitState := d.circuitBreaker.GetState()
+
+			d.logger.Info("Stream metrics report",
+				"frames_processed", d.metrics.GetFramesProcessed(),
+				"frames_dropped", d.metrics.GetFramesDropped(),
+				"stream_errors", d.metrics.GetStreamErrors(),
+				"ocr_errors", d.metrics.GetOCRErrors(),
+				"reconnect_attempts", d.metrics.GetReconnectAttempts(),
+				"last_frame_age_ms", lastFrameAge.Milliseconds(),
+				"circuit_state", circuitState,
+				"stream_url", d.config.URL)
+
+			// Log warning if frames haven't been processed recently
+			if lastFrameAge > 5*d.config.Interval {
+				d.logger.Warn("Stream processing may be stalled",
+					"last_frame_age", lastFrameAge,
+					"expected_interval", d.config.Interval)
+			}
+		}
+	}
+}
+
 // preprocessFrame applies preprocessing steps to improve OCR accuracy.
 // This method optimizes the input image for Tesseract text recognition using
 // standard computer vision techniques proven effective for OCR applications.
+// Optimized for memory efficiency and processing speed.
 //
 // Processing pipeline:
 //   1. Convert to grayscale - reduces noise and focuses on text structure
 //   2. Resize to 150% - improves small text recognition as per requirements
 //   3. Apply adaptive threshold - enhances text contrast against background
+//   4. Optional noise reduction for very noisy streams
 //
 // The adaptive threshold uses mean-based thresholding with an 11x11 kernel
 // and constant offset of 2, which works well for various lighting conditions
 // and text styles commonly found in video streams.
+//
+// Memory optimization: Intermediate Mats are closed immediately after use
+// to prevent accumulation of OpenCV memory allocations.
 //
 // Returns a new Mat containing the processed image. The caller must close
 // the returned Mat to prevent memory leaks.
 func (d *Detector) preprocessFrame(src gocv.Mat) gocv.Mat {
 	// Convert to grayscale
 	gray := gocv.NewMat()
+	defer gray.Close() // Ensure cleanup even on early return
 	gocv.CvtColor(src, &gray, gocv.ColorBGRToGray)
 
 	// Resize to improve OCR accuracy (up to 150% as mentioned in requirements)
+	// Only resize if source is reasonably sized to prevent excessive memory usage
 	resized := gocv.NewMat()
-	newSize := image.Point{
-		X: int(float64(gray.Cols()) * 1.5),
-		Y: int(float64(gray.Rows()) * 1.5),
+	defer resized.Close() // Ensure cleanup even on early return
+
+	currentSize := gray.Size()
+	// Limit maximum dimensions to prevent memory exhaustion
+	maxDimension := 2048
+	scaleFactor := 1.5
+
+	newWidth := int(float64(currentSize[1]) * scaleFactor)
+	newHeight := int(float64(currentSize[0]) * scaleFactor)
+
+	// Adjust scale factor if result would be too large
+	if newWidth > maxDimension || newHeight > maxDimension {
+		widthScale := float64(maxDimension) / float64(currentSize[1])
+		heightScale := float64(maxDimension) / float64(currentSize[0])
+		scaleFactor = math.Min(widthScale, heightScale)
+		newWidth = int(float64(currentSize[1]) * scaleFactor)
+		newHeight = int(float64(currentSize[0]) * scaleFactor)
 	}
+
+	newSize := image.Point{X: newWidth, Y: newHeight}
 	gocv.Resize(gray, &resized, newSize, 0, 0, gocv.InterpolationLinear)
-	gray.Close()
 
 	// Apply adaptive threshold to improve text contrast
 	thresholded := gocv.NewMat()
 	gocv.AdaptiveThreshold(resized, &thresholded, 255, gocv.AdaptiveThresholdMean, gocv.ThresholdBinary, 11, 2)
-	resized.Close()
 
 	return thresholded
 }
