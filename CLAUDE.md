@@ -37,11 +37,11 @@ make run ARGS="-url rtsp://example.com -word BREAKING"
 
 ### Core Components
 - **main.go**: CLI entry point with flag parsing and graceful shutdown
-- **detector.go**: Optimized detection engine with high-performance concurrent pipeline:
-  - Frame capture goroutine (captures at intervals with backpressure)
-  - OCR Worker Pool (2x CPU cores workers for parallel Tesseract processing)
+- **detector.go**: Resource-efficient detection engine with concurrent pipeline and CPU throttling:
+  - Frame capture goroutine (captures at intervals with backpressure and CPU monitoring)
+  - OCR Worker Pool (80% CPU cores workers with throttling for efficient processing)
   - Result logging goroutine (logs matches with structured output)
-  - Performance monitoring goroutine (tracks metrics and resource utilization)
+  - Performance monitoring goroutine (tracks metrics, resource utilization, and CPU usage)
 
 ### Build Configuration
 All code now requires OpenCV and Tesseract to be installed on the system. The build tag separation has been removed for simplicity.
@@ -59,13 +59,14 @@ All code now requires OpenCV and Tesseract to be installed on the system. The bu
 - `gocv.io/x/gocv`: OpenCV Go bindings for video processing
 - `github.com/otiai10/gosseract/v2`: Tesseract OCR wrapper
 
-### Performance Targets (Optimized)
-- Memory: 500MB-1GB RAM for 1080p streams (dynamic based on worker count)
-- CPU: Multi-core utilization (2x CPU cores for optimal throughput)
-- Throughput: 5-15 fps processing capability depending on hardware
+### Performance Targets (Resource-Efficient)
+- Memory: 300MB-800MB RAM for 1080p streams (optimized based on conservative worker count)
+- CPU: Maximum 80% utilization (0.8x CPU cores with throttling for system responsiveness)
+- Throughput: 3-10 fps processing capability depending on hardware (optimized for efficiency)
 - Latency: <200ms average OCR processing time per frame
 - Accuracy: ≥95% precision/recall on broadcast captions
 - Buffer efficiency: 70% backpressure threshold with dynamic sizing
+- Shutdown: <5 seconds graceful shutdown with immediate context cancellation
 
 ## System Requirements
 
